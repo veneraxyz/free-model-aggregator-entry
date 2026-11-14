@@ -1,33 +1,32 @@
-// free-model-aggregator-01 entry, v2: one server, two client wires, ten free providers.
+// free-model-aggregator-01 entry, v3: one server, two client wires, ten free providers.
 //
-// ROUTING (v2: the planner). v1 routed each request greedily as it arrived and
-// averaged ~26 upstream calls on fresh trials. v2 plans the whole workload before
-// serving the first request, because the brief's manifest lists all 20 requests
-// up front — and the failure structure makes the assignment, not the per-request
-// choice, the thing that decides the call count.
+// ROUTING (v3: the planner, corrected, with re-planning on drop). v2 planned the
+// whole workload once before serving and followed the plan to the end. v3 keeps
+// that plan but fixes two things the v2 tournament found, both validated on
+// 15,000 fresh simulated draws (never on any one trial's schedule):
 //
-//   - Every provider's first call always succeeds: its scheduled failures sit at
-//     call numbers 2 and up, its outage starts at call 2 or later, and its budget
-//     is at least 4. So a provider's first call is free, and every call after it
-//     carries a risk that depends on the provider's budget range: a provider with
-//     a 4-5 call budget fails its second call far more often than one with 12-16.
-//   - The planner therefore assigns the 20 requests to minimise the EXPECTED
-//     number of failed calls, computed from each provider's fixed budget range
-//     (a generator parameter, identical on every instance — structural knowledge,
-//     not a schedule for any one trial), subject to a quality-loss budget of 285
-//     milli-weight. Quality 99 needs the loss under 382, so 285 leaves a margin
-//     for failovers that land on a weaker model.
-//   - The plan starts quality-optimal (every request on its best-rated free model)
-//     and then takes the moves that cut expected failures most per milli of quality
-//     lost, until no such move is left. On the practice workload it lands on
-//     openrouter 8, gemini 3, cloudflare 2, and one call each for the other seven
-//     providers, at 282 milli of planned loss.
-//   - Serving follows the plan: the planned provider first, then the remaining
-//     providers by rating. A transient refusal is retried once on the same
-//     provider; a spent budget or an outage drops the provider for the trial.
-//     Exactly one provider call ever succeeds per request.
-//   - An OpenAI-wire JSON-mode request never goes to an anthropic-wire provider:
-//     that wire cannot carry JSON mode, so its echo would fail the client's check.
+//   1. The call-2 risk was undercounted. Every trial forces ONE provider (one in
+//      ten) to fail its second call, on top of its one or two scheduled failures.
+//      So a provider's second call fails with probability 0.1 + 0.9 x (its natural
+//      fail-call rate) — not just the natural rate — and a provider that IS the
+//      forced one has one fewer natural fail-call slot left for calls 3 and up.
+//      The planner's failChance now says exactly that. Under the corrected model
+//      the initial plan lands on the same assignment v2 used (openrouter 9,
+//      gemini 3, one call each for the other eight, 277 milli of planned loss),
+//      but the re-plans below price risk correctly.
+//   2. A dropped provider changes the feasible set, and the static plan has no
+//      answer for it: its remaining requests fall through the rating-desc
+//      fallback, which piles them onto the highest-rated survivor regardless of
+//      that provider's remaining budget. So after any request during which a
+//      provider dropped (spent budget or outage — never on a transient refusal,
+//      which changes nothing about the feasible set), v3 re-plans the REMAINING
+//      requests from the current call counts, with the loss budget that is left:
+//      a 362-milli total ceiling minus the loss already committed by served
+//      requests. Quality 99 needs the loss under 382, so 362 leaves 20 milli
+//      for failovers after the last re-plan. The re-plan is a pure function of
+//      the remaining manifest, the call counts, the dropped set, and the
+//      committed loss — all determined by the providers' answers so far — so a
+//      trial still replays byte for byte.
 //
 // WIRES. Every provider call is non-streaming: the full answer is collected, then
 // the client's response is rendered in the wire it used — JSON, or the server-sent
@@ -38,8 +37,9 @@
 //
 // DETERMINISM. No wall clock anywhere (all timestamps and ids are fixed literals),
 // no randomness at all: the plan is a pure function of the brief and the probes,
-// and routing is a pure function of the plan and the providers' answers so far.
-// The same trial replays byte for byte.
+// re-plans are pure functions of the trial state so far, and routing is a pure
+// function of the plan and the providers' answers so far. The same trial replays
+// byte for byte.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
@@ -66,9 +66,16 @@ const FIXED_CREATED = 1767225600;
 const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
 /** How many characters each streamed text delta carries (the providers' own slice). */
 const SSE_DELTA_CHARS = 13;
-/** The planner's quality-loss budget, in weight times rating milli. Quality 99 needs
- *  the loss under 382; 285 leaves room for failovers onto weaker models. */
-const LOSS_BUDGET_MILLI = 285;
+/** The initial plan's quality-loss budget, in weight times rating milli. Quality 99
+ *  needs the loss under 382. Under the corrected risk model the planner stops at
+ *  277 milli of planned loss for any budget from 277 to 331, so 318 is the budget
+ *  the tournament validated. */
+const LOSS_BUDGET_MILLI = 318;
+/** The total-loss ceiling a re-plan may spend up to, in weight times rating milli.
+ *  A re-plan's remaining budget is this minus the loss already committed by served
+ *  requests; 362 leaves 20 milli under the 382 quality-99 ceiling for failovers
+ *  after the last re-plan. */
+const REPLAN_BUDGET_MILLI = 362;
 
 /**
  * Each provider's free-tier budget range, in calls per trial, as the trial generator
@@ -386,6 +393,10 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** The plan, one assignment per manifest row, computed once the probes are in. */
 let plan: PlannedRequest[] = [];
+/** Quality loss already committed by served requests, in weight times rating milli:
+ *  the sum over served rows of weight x (best rating - served rating). A re-plan
+ *  may only spend what is left of the re-plan budget after this. */
+let committedLoss = 0;
 
 interface ProviderState {
   calls: number;
@@ -449,7 +460,8 @@ async function load(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// The planner: assign every manifest request to a provider before serving.
+// The planner: assign manifest requests to providers before serving, and
+// re-plan what is left whenever a provider drops.
 // ---------------------------------------------------------------------------
 
 /** Whether a quality row's capabilities meet one request's requirements. */
@@ -487,11 +499,17 @@ function probeOf(providerId: string): Probe | null {
 /**
  * The chance that a provider's n-th call of the trial is refused, from its budget
  * range alone. Call 1 never fails. From call 2 on: the budget may be spent (the
- * drawn budget is under n), the call number may be one of the provider's one or
- * two scheduled failures (drawn from call 2 up to the budget), or the provider
- * may be the trial's one outage provider and already down (one provider in ten,
- * down from a call number drawn the same way). The budget is uniform over the
- * range, so each term averages over it.
+ * drawn budget is under n), the call number may be one of the provider's scheduled
+ * failures, or the provider may be the trial's one outage provider and already
+ * down (one provider in ten, down from a call number drawn the same way). The
+ * budget is uniform over the range, so each term averages over it.
+ *
+ * The scheduled-failure term is corrected for the forced second call: every trial
+ * forces exactly one provider (one in ten) to fail its second call, on top of its
+ * one or two scheduled failures. So call 2 fails with probability 0.1 + 0.9 x the
+ * natural rate — and a provider that IS the forced one has one fewer natural
+ * fail-call slot left for calls 3 and up, which lowers those calls' natural rate
+ * a touch. v2's model used the natural rate for every call and undercounted call 2.
  */
 function failChance(providerId: string, n: number): number {
   if (n <= 1) return 0;
@@ -502,10 +520,14 @@ function failChance(providerId: string, n: number): number {
     const weight = 1 / span;
     if (n > budget) {
       chance += weight;
-    } else {
-      if (n <= budget - 1) chance += weight * (1.5 / (budget - 2));
-      chance += weight * 0.1 * Math.min(1, Math.max(0, (n - 1) / (budget - 2)));
+      continue;
     }
+    if (n === 2) {
+      chance += weight * (0.1 + 0.9 * (1.5 / (budget - 2)));
+    } else if (n <= budget - 1) {
+      chance += weight * (0.1 * (0.5 / Math.max(1, budget - 3)) + 0.9 * (1.5 / (budget - 2)));
+    }
+    chance += weight * 0.1 * Math.min(1, Math.max(0, (n - 1) / (budget - 2)));
   }
   return Math.min(0.999, chance);
 }
@@ -525,16 +547,29 @@ interface PlannedRequest {
 }
 
 /**
- * Plan the workload: one provider per manifest request, minimising the expected
- * failed calls subject to the quality-loss budget. Starts quality-optimal (every
- * request on its best-rated free model) and then takes, until none is left, the
- * move that cuts expected failures most per milli of quality lost — a move that
- * also improves quality is taken first. Deterministic: requests and providers are
- * scanned in fixed order, and a move only wins on a strict improvement.
+ * Plan a set of requests: one provider per request, minimising the expected failed
+ * calls subject to a quality-loss budget. The plan starts quality-optimal over the
+ * providers still standing (every request on its best-rated free model among them)
+ * and then takes, until none is left, the move that cuts expected failures most per
+ * milli of quality lost — a move that also improves quality is taken first.
+ * Deterministic: requests and providers are scanned in fixed order, and a move
+ * only wins on a strict improvement.
+ *
+ * `baseCounts` are the calls already made on each provider (zero for the initial
+ * plan); the cost of an assignment counts the marginal failures of the calls it
+ * adds on top of those. `dropped` excludes providers that are done for the trial.
+ * Loss is always measured against the GLOBAL best rating — the best model on any
+ * probed provider, dropped or not — because that is what the quality score pays
+ * on. So a re-plan's starting loss is not zero when the best provider has dropped:
+ * it is the loss the best still-standing assignment already carries.
  */
-function computePlan(): PlannedRequest[] {
-  const manifest = brief.manifest;
-  const assignment: PlannedRequest[] = manifest.map((request) => {
+function computePlanFor(
+  requests: WorkloadRequest[],
+  baseCounts: ReadonlyMap<string, number>,
+  dropped: ReadonlySet<string>,
+  lossBudget: number,
+): PlannedRequest[] {
+  const assignment: PlannedRequest[] = requests.map((request) => {
     let best: PlannedRequest = { providerId: null, model: null, rating: -1, bestRating: -1 };
     for (const provider of brief.providers) {
       const probe = probeOf(provider.id);
@@ -542,32 +577,36 @@ function computePlan(): PlannedRequest[] {
       const row = bestModelFor(provider, probe, request);
       if (row === null) continue;
       if (row.rating_milli > best.bestRating) best.bestRating = row.rating_milli;
+      if (dropped.has(provider.id)) continue;
       if (row.rating_milli > best.rating) best = { providerId: provider.id, model: row.model, rating: row.rating_milli, bestRating: best.bestRating };
     }
-    // Keep the best rating even when the assignment itself is empty.
     if (best.providerId === null) best.bestRating = Math.max(0, best.bestRating);
     return best;
   });
   const counts = new Map<string, number>();
-  for (const provider of brief.providers) counts.set(provider.id, 0);
+  for (const provider of brief.providers) counts.set(provider.id, baseCounts.get(provider.id) ?? 0);
   for (const slot of assignment) if (slot.providerId !== null) counts.set(slot.providerId, (counts.get(slot.providerId) ?? 0) + 1);
-  // The start is quality-optimal, so the loss starts at zero and only grows as
-  // moves trade quality for fewer expected failures.
-  let loss = 0;
+  // The starting loss is the loss of the quality-optimal-over-survivors start,
+  // measured against the global best — zero for the initial plan, positive for a
+  // re-plan when the best provider has dropped.
+  let loss = assignment.reduce((sum, slot, i) => {
+    if (slot.providerId === null || slot.rating < 0) return sum;
+    return sum + requests[i].weight * (slot.bestRating - slot.rating);
+  }, 0);
   for (;;) {
     let bestMove: { index: number; providerId: string; model: string; rating: number; dLoss: number; dCost: number; ratio: number } | null = null;
     for (let i = 0; i < assignment.length; i++) {
       const slot = assignment[i];
       if (slot.providerId === null) continue;
-      const request = manifest[i];
+      const request = requests[i];
       for (const provider of brief.providers) {
-        if (provider.id === slot.providerId) continue;
+        if (provider.id === slot.providerId || dropped.has(provider.id)) continue;
         const probe = probeOf(provider.id);
         if (probe === null) continue;
         const row = bestModelFor(provider, probe, request);
         if (row === null) continue;
         const dLoss = request.weight * (slot.rating - row.rating_milli);
-        if (loss + dLoss > LOSS_BUDGET_MILLI) continue;
+        if (loss + dLoss > lossBudget) continue;
         const fromCount = counts.get(slot.providerId) ?? 0;
         const toCount = counts.get(provider.id) ?? 0;
         const dCost = (expectedFailures(provider.id, toCount + 1) - expectedFailures(provider.id, toCount)) - (expectedFailures(slot.providerId, fromCount) - expectedFailures(slot.providerId, fromCount - 1));
@@ -591,6 +630,34 @@ function computePlan(): PlannedRequest[] {
   const countsText = brief.providers.map((p) => `${p.id}=${counts.get(p.id) ?? 0}`).join(' ');
   log(`plan: ${assignment.length} requests, planned loss ${loss} milli, expected failures ${totalCost.toFixed(2)} (${countsText})`);
   return assignment;
+}
+
+/** The initial plan: the whole manifest, no calls made yet, nobody dropped. */
+function computePlan(): PlannedRequest[] {
+  const baseCounts = new Map<string, number>();
+  for (const provider of brief.providers) baseCounts.set(provider.id, 0);
+  return computePlanFor(brief.manifest, baseCounts, new Set<string>(), LOSS_BUDGET_MILLI);
+}
+
+/**
+ * Re-plan the manifest rows from `fromIndex` on, after a provider dropped. The
+ * remaining budget is the re-plan ceiling minus the loss already committed by
+ * served requests, floored at zero; the base counts are the calls made so far.
+ * Rows already served keep their assignments. A pure function of the trial state
+ * so far, so a replay re-plans identically.
+ */
+function replanFrom(fromIndex: number): void {
+  if (fromIndex >= brief.manifest.length) return;
+  const baseCounts = new Map<string, number>();
+  const dropped = new Set<string>();
+  for (const provider of brief.providers) {
+    baseCounts.set(provider.id, stateOf(provider.id).calls);
+    if (stateOf(provider.id).dropped) dropped.add(provider.id);
+  }
+  const remainingBudget = Math.max(0, REPLAN_BUDGET_MILLI - committedLoss);
+  log(`replan: from row ${fromIndex}, committed loss ${committedLoss} milli, remaining budget ${remainingBudget} milli`);
+  const fresh = computePlanFor(brief.manifest.slice(fromIndex), baseCounts, dropped, remainingBudget);
+  for (let i = 0; i < fresh.length; i++) plan[fromIndex + i] = fresh[i];
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,6 +1106,7 @@ function greedyCandidates(requires: Requirement, clientApi: 'openai' | 'anthropi
 interface ServedAnswer {
   providerId: string;
   model: string;
+  rating: number;
   answer: ProviderAnswer;
 }
 
@@ -1048,7 +1116,8 @@ interface ServedAnswer {
  * provider, in which case the plan is skipped for this request. Then the remaining
  * providers by rating. A transient refusal is retried once on the same provider;
  * a spent budget or an outage drops the provider and fails over. Returns null
- * when no provider served.
+ * when no provider served. The served rating rides along so the caller can book
+ * the request's committed loss without a second lookup.
  */
 async function serve(
   view: RequestView,
@@ -1078,7 +1147,7 @@ async function serve(
     if (state.dropped) continue;
     for (let attempt = 0; attempt < 2; attempt++) {
       const outcome = await callProvider(candidate.provider, candidate.model, view);
-      if (outcome.ok) return { providerId: candidate.provider.id, model: candidate.model, answer: outcome.answer };
+      if (outcome.ok) return { providerId: candidate.provider.id, model: candidate.model, rating: candidate.rating, answer: outcome.answer };
       if (outcome.kind === 'spent' || outcome.kind === 'out') {
         log(`${candidate.provider.id} is done for the trial (${outcome.detail})`);
         state.dropped = true;
@@ -1300,7 +1369,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   const body = parsed.body;
   const view = api === 'openai' ? viewFromOpenAI(body) : viewFromAnthropic(body);
   const requires = row.index < brief.manifest.length ? row.requires : requirementsFromBody(api, body);
+  // Snapshot the dropped set: a provider that drops while this request is served
+  // changes the feasible set, and the remaining rows get re-planned for it.
+  const droppedBefore = new Set<string>();
+  for (const provider of brief.providers) if (stateOf(provider.id).dropped) droppedBefore.add(provider.id);
   const served = await serve(view, requires, api, row.index);
+  // Book this request's committed loss, then re-plan what is left if the feasible
+  // set changed. Both run synchronously here, before the response goes out, so no
+  // other request can interleave between the booking and the re-plan.
+  if (served !== null && row.index < plan.length) {
+    const slot = plan[row.index];
+    committedLoss += row.weight * Math.max(0, slot.bestRating - served.rating);
+  }
+  const droppedNow = brief.providers.some((p) => stateOf(p.id).dropped && !droppedBefore.has(p.id));
+  if (droppedNow) replanFrom(row.index + 1);
   if (served === null) {
     sendJson(res, 503, { error: { message: 'no provider could serve this request', type: 'service_unavailable', code: 'service_unavailable' } });
     return;
