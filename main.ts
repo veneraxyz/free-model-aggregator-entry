@@ -1,90 +1,95 @@
-// free-model-aggregator-01 entry, v3: one server, two client wires, ten free providers.
+// free-model-aggregator-01 entry, v3: a single server speaking two client wires,
+// fronting ten free providers behind one planner.
 //
-// ROUTING (v3: the planner, corrected, with re-planning on drop). v2 planned the
-// whole workload once before serving and followed the plan to the end. v3 keeps
-// that plan but fixes two things the v2 tournament found, both validated on
-// 15,000 fresh simulated draws (never on any one trial's schedule):
+// HOW REQUESTS ARE ROUTED (v3: a corrected planner that re-plans after a drop).
+// v2 planned the whole workload once up front and then stuck to that plan. v3
+// keeps the up-front plan but repairs two weaknesses the v2 tournament exposed,
+// both confirmed on 15,000 fresh simulated draws (never tuned to one trial):
 //
-//   1. The call-2 risk was undercounted. Every trial forces ONE provider (one in
-//      ten) to fail its second call, on top of its one or two scheduled failures.
-//      So a provider's second call fails with probability 0.1 + 0.9 x (its natural
-//      fail-call rate) — not just the natural rate — and a provider that IS the
-//      forced one has one fewer natural fail-call slot left for calls 3 and up.
-//      The planner's failChance now says exactly that. Under the corrected model
-//      the initial plan lands on the same assignment v2 used (openrouter 9,
-//      gemini 3, one call each for the other eight, 277 milli of planned loss),
-//      but the re-plans below price risk correctly.
-//   2. A dropped provider changes the feasible set, and the static plan has no
-//      answer for it: its remaining requests fall through the rating-desc
-//      fallback, which piles them onto the highest-rated survivor regardless of
-//      that provider's remaining budget. So after any request during which a
-//      provider dropped (spent budget or outage — never on a transient refusal,
-//      which changes nothing about the feasible set), v3 re-plans the REMAINING
-//      requests from the current call counts, with the loss budget that is left:
-//      a 362-milli total ceiling minus the loss already committed by served
-//      requests. Quality 99 needs the loss under 382, so 362 leaves 20 milli
-//      for failovers after the last re-plan. The re-plan is a pure function of
-//      the remaining manifest, the call counts, the dropped set, and the
-//      committed loss — all determined by the providers' answers so far — so a
-//      trial still replays byte for byte.
+//   1. Second-call risk was understated. Each trial forces exactly ONE provider
+//      (a one-in-ten chance for any given one) to refuse its second call, above
+//      and beyond its one or two scheduled refusals. So a provider's second call
+//      refuses with probability 0.1 + 0.9 x its natural fail-call rate — not the
+//      natural rate alone — and a provider that IS the forced one has one fewer
+//      natural fail-call slot remaining for its third call onward. The planner's
+//      refusalChance now encodes exactly that. With the corrected model the
+//      opening plan settles on the same split v2 used (openrouter 9, gemini 3,
+//      one call apiece for the other eight, 277 milli of planned loss), but the
+//      re-plans that follow now price risk properly.
+//   2. A provider dropping mid-trial changes what is feasible, and a fixed plan
+//      has no response: its leftover requests cascade into the rating-ordered
+//      fallback, which stacks them onto the best-rated survivor no matter how
+//      little budget that survivor has left. So whenever a request ends with a
+//      provider dropped (spent budget or outage — never after a merely transient
+//      refusal, which leaves the feasible set untouched), v3 re-plans the rows
+//      still to come from the live call counts, spending only the loss budget
+//      that remains: a 362-milli overall ceiling less the loss already booked by
+//      served rows. Quality 99 needs total loss under 382, so 362 keeps 20 milli
+//      in hand for failovers after the final re-plan. The re-plan depends only
+//      on the remaining manifest, the call counts, the dropped set, and the
+//      booked loss — all fixed by the providers' answers so far — so a trial
+//      still replays byte for byte.
 //
-// WIRES. Every provider call is non-streaming: the full answer is collected, then
-// the client's response is rendered in the wire it used — JSON, or the server-sent
-// event sequence for a stream. Translating between wires happens on the request side
-// only, and every echo-critical field passes through untouched: the system prompt,
-// the user text (images included, same bytes or same URL), the tool names in order,
-// max_tokens, the stop sequences in order, and JSON mode.
+// WIRES. Every upstream call is made without streaming: the whole answer is
+// gathered first, then the client's reply is rendered in the wire it spoke —
+// plain JSON, or the server-sent event sequence for a stream. Translation
+// between wires happens only while building the request, and every field the
+// client checks in the echo goes through untouched: the system prompt, the user
+// text (images included, identical bytes or identical URL), the tool names in
+// order, max_tokens, the stop sequences in order, and JSON mode.
 //
-// DETERMINISM. No wall clock anywhere (all timestamps and ids are fixed literals),
-// no randomness at all: the plan is a pure function of the brief and the probes,
-// re-plans are pure functions of the trial state so far, and routing is a pure
-// function of the plan and the providers' answers so far. The same trial replays
-// byte for byte.
+// DETERMINISM. The clock is never read (every timestamp and id is a literal),
+// nothing is random: the opening plan is a pure function of the brief and the
+// probes, re-plans are pure functions of the trial state so far, and routing is
+// a pure function of the plan and the providers' answers so far. Run the same
+// trial twice and the export matches byte for byte.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 
-type Wire = 'openai' | 'anthropic' | 'gemini';
-type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
-type Json = Record<string, unknown>;
+type ProviderWire = 'openai' | 'anthropic' | 'gemini';
+type AuthMethod = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
+type JsonObject = Record<string, unknown>;
 
-const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
+function isJsonObject(v: unknown): v is JsonObject {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
 
-/** The register body's protocol version. */
+/** The protocol version the register body carries. */
 const PROTOCOL_VERSION = 1;
-/** How often GET /work is polled, in milliseconds. */
+/** The gap between GET /work polls, in milliseconds. */
 const POLL_INTERVAL_MS = 100;
-/** How long one provider catalog probe may take. */
+/** The longest a provider catalog probe may run. */
 const PROBE_TIMEOUT_MS = 5000;
-/** How long one provider inference call may take (the client allows 30 s a request). */
+/** The longest one provider inference call may run (the client allows 30 s per request). */
 const CALL_TIMEOUT_MS = 10000;
-/** The most bytes of one client request body this server reads. */
+/** The largest client request body this server will read, in bytes. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
-/** The fixed epoch second every OpenAI-shaped reply reports: nothing reads the clock. */
-const FIXED_CREATED = 1767225600;
-/** The fixed instant every Anthropic-shaped model listing reports. */
+/** The fixed epoch second stamped on every OpenAI-shaped reply: the clock is never read. */
+const FIXED_TIMESTAMP = 1767225600;
+/** The fixed instant stamped on every Anthropic-shaped model listing. */
 const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
-/** How many characters each streamed text delta carries (the providers' own slice). */
-const SSE_DELTA_CHARS = 13;
-/** The initial plan's quality-loss budget, in weight times rating milli. Quality 99
- *  needs the loss under 382. Under the corrected risk model the planner stops at
- *  277 milli of planned loss for any budget from 277 to 331, so 318 is the budget
- *  the tournament validated. */
-const LOSS_BUDGET_MILLI = 318;
+/** The characters each streamed text delta carries (the providers' own slice size). */
+const STREAM_CHUNK_CHARS = 13;
+/** The opening plan's quality-loss budget, in weight times rating milli. Quality 99
+ *  needs total loss under 382. Under the corrected risk model the planner settles
+ *  at 277 milli of planned loss for any budget between 277 and 331, so 318 is the
+ *  budget the tournament validated. */
+const INITIAL_LOSS_BUDGET = 318;
 /** The total-loss ceiling a re-plan may spend up to, in weight times rating milli.
- *  A re-plan's remaining budget is this minus the loss already committed by served
- *  requests; 362 leaves 20 milli under the 382 quality-99 ceiling for failovers
+ *  A re-plan's remaining budget is this less the loss already booked by served
+ *  rows; 362 keeps 20 milli under the 382 quality-99 ceiling for failovers
  *  after the last re-plan. */
-const REPLAN_BUDGET_MILLI = 362;
+const REPLAN_LOSS_CEILING = 362;
 
 /**
- * Each provider's free-tier budget range, in calls per trial, as the trial generator
- * draws it: [min, max], uniform. These are fixed generator parameters, the same on
- * every instance the competition grades — the planner's risk model is built on them,
- * and it never sees any one trial's drawn budgets. A provider not listed here gets
- * the middle-of-the-road range [5, 8].
+ * Each provider's free-tier budget range, in calls per trial, as the trial
+ * generator draws it: [min, max], uniform. These are fixed generator parameters,
+ * identical on every instance the competition grades — the planner's risk model
+ * is built from them, and it never learns any one trial's drawn budgets. A
+ * provider missing from this table gets the middle-of-the-road range [5, 8].
  */
-const BUDGET_RANGES: Readonly<Record<string, readonly [number, number]>> = {
+const PROVIDER_BUDGET_RANGES: Readonly<Record<string, readonly [number, number]>> = {
   groq: [9, 12],
   cerebras: [5, 6],
   gemini: [6, 8],
@@ -96,29 +101,29 @@ const BUDGET_RANGES: Readonly<Record<string, readonly [number, number]>> = {
   ovh: [5, 6],
   kilol: [12, 16],
 };
-const DEFAULT_BUDGET_RANGE: readonly [number, number] = [5, 8];
+const FALLBACK_BUDGET_RANGE: readonly [number, number] = [5, 8];
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
+const ENV_ORIGIN = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+const BRIEF_PATH = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
 // ---------------------------------------------------------------------------
-// The brief: directory, quality table, workload manifest.
+// The brief: provider directory, quality table, workload manifest.
 // ---------------------------------------------------------------------------
 
-interface ProviderEntry {
+interface Provider {
   id: string;
   name: string;
-  wire: Wire;
-  auth: AuthScheme;
-  base: string;
-  key_env: string;
+  wire: ProviderWire;
+  auth: AuthMethod;
+  basePath: string;
+  keyEnv: string;
   key: string;
 }
 
-interface RatingRow {
+interface Rating {
   model: string;
   provider: string;
-  rating_milli: number;
+  rating: number;
   context_length: number | null;
   tools: boolean;
   vision: boolean;
@@ -126,151 +131,154 @@ interface RatingRow {
   free: boolean;
 }
 
-interface Requirement {
+interface RequestNeeds {
   tools?: boolean;
   vision?: boolean;
   json?: boolean;
   min_context?: number;
 }
 
-interface WorkloadRequest {
+interface ManifestRow {
   id: string;
   api: 'openai' | 'anthropic';
   stream: boolean;
   weight: number;
-  requires: Requirement;
+  requires: RequestNeeds;
 }
 
-interface Brief {
-  providers: ProviderEntry[];
-  ratings: RatingRow[];
-  manifest: WorkloadRequest[];
+interface BriefDoc {
+  providers: Provider[];
+  ratings: Rating[];
+  manifest: ManifestRow[];
   error: string | null;
 }
 
-const PROVIDERS_SCHEMA = 'free-model-aggregator-01/providers/v1';
-const RATINGS_SCHEMA = 'free-model-aggregator-01/ratings/v1';
-const WORKLOAD_SCHEMA = 'free-model-aggregator-01/workload/v1';
+const SCHEMA_PROVIDERS = 'free-model-aggregator-01/providers/v1';
+const SCHEMA_RATINGS = 'free-model-aggregator-01/ratings/v1';
+const SCHEMA_WORKLOAD = 'free-model-aggregator-01/workload/v1';
 
-/** The index of the `}` closing the object that opens at `start`, or -1. */
-function objectEnd(text: string, start: number): number {
-  let depth = 0;
-  let inString = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (ch === '\\') i += 1;
-      else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
-    else if (ch === '{') depth += 1;
-    else if (ch === '}') {
-      depth -= 1;
-      if (depth === 0) return i;
+/** The index of the `}` that closes the object opening at `open`, or -1. */
+function matchingBrace(source: string, open: number): number {
+  let nesting = 0;
+  let insideString = false;
+  for (let k = open; k < source.length; k++) {
+    const char = source[k];
+    if (insideString) {
+      if (char === '\\') k++;
+      else if (char === '"') insideString = false;
+    } else if (char === '"') insideString = true;
+    else if (char === '{') nesting++;
+    else if (char === '}') {
+      nesting--;
+      if (nesting === 0) return k;
     }
   }
   return -1;
 }
 
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
-function documentsIn(text: string): Json[] {
-  const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
-    try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
-      if (isRecord(value) && typeof value.schema === 'string') out.push(value);
-    } catch {
-      // Not JSON on its own: look on.
+/** Every JSON object in `source` carrying a string `schema`, in order of appearance. */
+function extractDocuments(source: string): JsonObject[] {
+  const collected: JsonObject[] = [];
+  let cursor = source.indexOf('{');
+  while (cursor !== -1) {
+    const close = matchingBrace(source, cursor);
+    if (close !== -1) {
+      try {
+        const parsed: unknown = JSON.parse(source.slice(cursor, close + 1));
+        if (isJsonObject(parsed) && typeof parsed.schema === 'string') collected.push(parsed);
+      } catch {
+        // Not JSON on its own: keep looking.
+      }
     }
+    cursor = source.indexOf('{', cursor + 1);
   }
-  return out;
+  return collected;
 }
 
-function stringOf(v: unknown): string {
+function asString(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
 
-function numberOrNull(v: unknown): number | null {
+function asNumberOrNull(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null;
 }
 
-function parseProvider(v: unknown): ProviderEntry | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
+function providerFrom(input: unknown): Provider | null {
+  if (!isJsonObject(input)) return null;
+  const id = asString(input.id);
+  const wire = input.wire === 'openai' || input.wire === 'anthropic' || input.wire === 'gemini' ? input.wire : null;
   if (id === '' || wire === null) return null;
-  const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
-  const base =
-    stringOf(v.path) !== '' ? stringOf(v.path)
-    : stringOf(v.base_path) !== '' ? stringOf(v.base_path)
-    : stringOf(v.base_url) !== '' ? stringOf(v.base_url)
-    : stringOf(v.base);
-  return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
+  const auth = input.auth === 'bearer' || input.auth === 'x-api-key' || input.auth === 'x-goog-api-key' || input.auth === 'none' ? input.auth : 'bearer';
+  let basePath = asString(input.path);
+  if (basePath === '') basePath = asString(input.base_path);
+  if (basePath === '') basePath = asString(input.base_url);
+  if (basePath === '') basePath = asString(input.base);
+  const name = asString(input.name);
+  return { id, name: name !== '' ? name : id, wire, auth, basePath, keyEnv: asString(input.key_env), key: asString(input.key) };
 }
 
-function parseRating(v: unknown): RatingRow | null {
-  if (!isRecord(v)) return null;
-  const model = stringOf(v.model);
-  const provider = stringOf(v.provider);
+function ratingFrom(input: unknown): Rating | null {
+  if (!isJsonObject(input)) return null;
+  const model = asString(input.model);
+  const provider = asString(input.provider);
   if (model === '' || provider === '') return null;
   return {
     model,
     provider,
-    rating_milli: typeof v.rating_milli === 'number' && Number.isFinite(v.rating_milli) ? v.rating_milli : 0,
-    context_length: numberOrNull(v.context_length),
-    tools: v.tools === true,
-    vision: v.vision === true,
-    json: v.json === true,
-    free: v.free === true,
+    rating: typeof input.rating_milli === 'number' && Number.isFinite(input.rating_milli) ? input.rating_milli : 0,
+    context_length: asNumberOrNull(input.context_length),
+    tools: input.tools === true,
+    vision: input.vision === true,
+    json: input.json === true,
+    free: input.free === true,
   };
 }
 
-function parseWorkloadRequest(v: unknown): WorkloadRequest | null {
-  if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+function workloadRowFrom(input: unknown): ManifestRow | null {
+  if (!isJsonObject(input)) return null;
+  const id = asString(input.id);
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
-  const out: Requirement = {};
+  const requires = isJsonObject(input.requires) ? input.requires : {};
+  const out: RequestNeeds = {};
   if (requires.tools === true) out.tools = true;
   if (requires.vision === true) out.vision = true;
   if (requires.json === true) out.json = true;
   if (typeof requires.min_context === 'number' && Number.isFinite(requires.min_context)) out.min_context = requires.min_context;
-  return { id, api: v.api === 'anthropic' ? 'anthropic' : 'openai', stream: v.stream === true, weight: v.weight === 2 ? 2 : 1, requires: out };
+  return { id, api: input.api === 'anthropic' ? 'anthropic' : 'openai', stream: input.stream === true, weight: input.weight === 2 ? 2 : 1, requires: out };
 }
 
-function readBrief(path: string): Brief {
-  const empty: Brief = { providers: [], ratings: [], manifest: [], error: null };
+function loadBrief(path: string): BriefDoc {
+  const empty: BriefDoc = { providers: [], ratings: [], manifest: [], error: null };
   if (path === '') return { ...empty, error: 'MAKEFUN_PROMPT_FILE is not set' };
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
-  } catch (err) {
-    return { ...empty, error: `cannot read ${path}: ${(err as Error).message}` };
+  } catch (error) {
+    return { ...empty, error: `cannot read ${path}: ${(error as Error).message}` };
   }
-  const docs = documentsIn(text);
-  const directoryDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
+  const docs = extractDocuments(text);
+  const directoryDoc = docs.find((doc) => doc.schema === SCHEMA_PROVIDERS && Array.isArray(doc.providers)) ?? null;
   if (directoryDoc === null || !Array.isArray(directoryDoc.providers)) {
-    return { ...empty, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
+    return { ...empty, error: `the brief at ${path} holds no ${SCHEMA_PROVIDERS} document` };
   }
-  const providers = directoryDoc.providers.flatMap((v) => {
-    const p = parseProvider(v);
-    return p === null ? [] : [p];
+  const providers = directoryDoc.providers.flatMap((item) => {
+    const entry = providerFrom(item);
+    return entry === null ? [] : [entry];
   });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
+  const ratingsDoc = docs.find((doc) => doc.schema === SCHEMA_RATINGS && Array.isArray(doc.ratings)) ?? null;
   const ratings =
     ratingsDoc !== null && Array.isArray(ratingsDoc.ratings)
-      ? ratingsDoc.ratings.flatMap((v) => {
-          const r = parseRating(v);
-          return r === null ? [] : [r];
+      ? ratingsDoc.ratings.flatMap((item) => {
+          const entry = ratingFrom(item);
+          return entry === null ? [] : [entry];
         })
       : [];
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
+  const workloadDoc = docs.find((doc) => doc.schema === SCHEMA_WORKLOAD && Array.isArray(doc.manifest)) ?? null;
   const manifest =
     workloadDoc !== null && Array.isArray(workloadDoc.manifest)
-      ? workloadDoc.manifest.flatMap((v) => {
-          const w = parseWorkloadRequest(v);
-          return w === null ? [] : [w];
+      ? workloadDoc.manifest.flatMap((item) => {
+          const entry = workloadRowFrom(item);
+          return entry === null ? [] : [entry];
         })
       : [];
   return { providers, ratings, manifest, error: null };
@@ -280,7 +288,7 @@ function readBrief(path: string): Brief {
 // The catalog probe.
 // ---------------------------------------------------------------------------
 
-interface ProbedModel {
+interface ListedModel {
   id: string;
   display_name: string;
   free: boolean | null;
@@ -290,95 +298,104 @@ interface ProbedModel {
   json: boolean | null;
 }
 
-interface Probe {
-  provider: ProviderEntry;
+interface ProbeResult {
+  provider: Provider;
   ok: boolean;
   status: number;
-  models: ProbedModel[];
+  models: ListedModel[];
   error: string | null;
 }
 
-interface CatalogModel {
+interface ModelEntry {
   id: string;
   free: boolean;
   context_length: number | null;
 }
 
-interface CatalogProvider {
+interface CatalogedProvider {
   id: string;
   base_url: string;
   key_env: string;
-  wire: Wire;
-  models: CatalogModel[];
+  wire: ProviderWire;
+  models: ModelEntry[];
 }
 
-interface CatalogReport {
-  providers: CatalogProvider[];
+interface Catalog {
+  providers: CatalogedProvider[];
 }
 
-/** A base path joined to the env's URL; an absolute base_url is used as it stands. */
-function joinBase(envUrl: string, base: string): string {
-  const b = base.trim();
-  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
+/** A base path joined onto the env's URL; an absolute base_url is used as it stands. */
+function resolveBase(envUrl: string, base: string): string {
+  const trimmed = base.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed.replace(/\/+$/, '');
   const prefix = envUrl.replace(/\/+$/, '');
-  if (b === '') return prefix;
-  return `${prefix}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
+  if (trimmed === '') return prefix;
+  return `${prefix}${trimmed.startsWith('/') ? '' : '/'}${trimmed.replace(/\/+$/, '')}`;
 }
 
-/** The headers a provider wants its key in. */
-function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
+/** The headers carrying a provider's key, in the shape its auth wants. */
+function headersForAuth(auth: AuthMethod, key: string): Record<string, string> {
   if (key === '') return {};
-  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
-  if (auth === 'x-api-key') return { 'x-api-key': key };
-  if (auth === 'x-goog-api-key') return { 'x-goog-api-key': key };
-  return {};
+  switch (auth) {
+    case 'bearer':
+      return { authorization: `Bearer ${key}` };
+    case 'x-api-key':
+      return { 'x-api-key': key };
+    case 'x-goog-api-key':
+      return { 'x-goog-api-key': key };
+    default:
+      return {};
+  }
 }
 
-function boolOrNull(v: unknown): boolean | null {
+function asBoolOrNull(v: unknown): boolean | null {
   return typeof v === 'boolean' ? v : null;
 }
 
 /** One model as a listing wrote it, in whichever wire's spelling. */
-function modelIn(wire: Wire, v: unknown): ProbedModel | null {
-  if (!isRecord(v)) return null;
-  const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
+function modelFromListing(wire: ProviderWire, input: unknown): ListedModel | null {
+  if (!isJsonObject(input)) return null;
+  const id = wire === 'gemini' ? asString(input.name).replace(/^models\//, '') : asString(input.id);
   if (id === '') return null;
-  const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
+  const context = asNumberOrNull(input.context_length) ?? asNumberOrNull(input.context_window) ?? asNumberOrNull(input.inputTokenLimit);
+  let displayName = asString(input.display_name);
+  if (displayName === '') displayName = asString(input.displayName);
+  if (displayName === '') displayName = id;
   return {
     id,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id,
-    free: boolOrNull(v.free),
+    display_name: displayName,
+    free: asBoolOrNull(input.free),
     context_length: context,
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    tools: asBoolOrNull(input.tools),
+    vision: asBoolOrNull(input.vision),
+    json: asBoolOrNull(input.json),
   };
 }
 
 /** The models one catalog route's answer listed, in its wire's shape. */
-function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
-  if (!isRecord(body)) return [];
+function modelsFromListing(wire: ProviderWire, body: unknown): ListedModel[] {
+  if (!isJsonObject(body)) return [];
   const list = wire === 'gemini' ? body.models : body.data;
   if (!Array.isArray(list)) return [];
-  return list.flatMap((v) => {
-    const m = modelIn(wire, v);
-    return m === null ? [] : [m];
+  return list.flatMap((item) => {
+    const entry = modelFromListing(wire, item);
+    return entry === null ? [] : [entry];
   });
 }
 
 /** Probe one provider's catalog route, in its own wire, tolerating every failure. */
-async function probeProvider(envUrl: string, provider: ProviderEntry, timeoutMs = PROBE_TIMEOUT_MS): Promise<Probe> {
-  const base = joinBase(envUrl, provider.base);
-  const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
+async function probeOneProvider(envUrl: string, provider: Provider, timeoutMs = PROBE_TIMEOUT_MS): Promise<ProbeResult> {
+  const root = resolveBase(envUrl, provider.basePath);
+  const endpoint = provider.wire === 'gemini' ? `${root}/v1beta/models` : `${root}/v1/models`;
+  const hdrs: Record<string, string> = { accept: 'application/json', ...headersForAuth(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') hdrs['anthropic-version'] = '2023-06-01';
   try {
-    const res = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!res.ok) return { provider, ok: false, status: res.status, models: [], error: `GET ${url} answered HTTP ${res.status}` };
-    const body: unknown = await res.json();
-    return { provider, ok: true, status: res.status, models: modelsIn(provider.wire, body), error: null };
-  } catch (err) {
-    return { provider, ok: false, status: 0, models: [], error: `GET ${url} failed: ${(err as Error).message}` };
+    const response = await fetch(endpoint, { headers: hdrs, signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) return { provider, ok: false, status: response.status, models: [], error: `GET ${endpoint} answered HTTP ${response.status}` };
+    const payload: unknown = await response.json();
+    return { provider, ok: true, status: response.status, models: modelsFromListing(provider.wire, payload), error: null };
+  } catch (error) {
+    return { provider, ok: false, status: 0, models: [], error: `GET ${endpoint} failed: ${(error as Error).message}` };
   }
 }
 
@@ -386,86 +403,89 @@ async function probeProvider(envUrl: string, provider: ProviderEntry, timeoutMs 
 // Shared state: the brief, the probes, the one catalog, per-provider budgets.
 // ---------------------------------------------------------------------------
 
-const brief = readBrief(PROMPT_FILE);
-let probes: Probe[] = [];
-let catalog: CatalogReport = { providers: [] };
-/** How many client API requests have arrived: the manifest is in arrival order, one at a time. */
-let manifestIndex = 0;
+const briefing = loadBrief(BRIEF_PATH);
+let probeResults: ProbeResult[] = [];
+let registry: Catalog = { providers: [] };
+/** Client API requests arrived so far: the manifest runs in arrival order, one at a time. */
+let nextRow = 0;
 /** The plan, one assignment per manifest row, computed once the probes are in. */
-let plan: PlannedRequest[] = [];
-/** Quality loss already committed by served requests, in weight times rating milli:
+let assignments: PlannedRow[] = [];
+/** Quality loss already booked by served rows, in weight times rating milli:
  *  the sum over served rows of weight x (best rating - served rating). A re-plan
- *  may only spend what is left of the re-plan budget after this. */
-let committedLoss = 0;
+ *  may only spend what is left of the re-plan ceiling after this. */
+let lossCommitted = 0;
 
-interface ProviderState {
+interface ProviderUsage {
   calls: number;
   dropped: boolean;
 }
-const providerState = new Map<string, ProviderState>();
+const providerStates = new Map<string, ProviderUsage>();
 
-function stateOf(providerId: string): ProviderState {
-  let state = providerState.get(providerId);
-  if (state === undefined) {
-    state = { calls: 0, dropped: false };
-    providerState.set(providerId, state);
+function stateFor(providerId: string): ProviderUsage {
+  let usage = providerStates.get(providerId);
+  if (usage === undefined) {
+    usage = { calls: 0, dropped: false };
+    providerStates.set(providerId, usage);
   }
-  return state;
+  return usage;
 }
 
-function log(message: string): void {
+function note(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
 
 /** The quality table's row for one provider's model, when it has one. */
-function ratingRow(providerId: string, modelId: string): RatingRow | null {
-  return brief.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
+function ratingFor(providerId: string, modelId: string): Rating | null {
+  return briefing.ratings.find((entry) => entry.provider === providerId && entry.model === modelId) ?? null;
 }
 
 /** Whether a model is free: the quality table where it has a row, the listing's word otherwise. */
-function modelIsFree(model: ProbedModel, row: RatingRow | null): boolean {
+function isFreeModel(model: ListedModel, row: Rating | null): boolean {
   if (row !== null) return row.free;
   return model.free ?? false;
 }
 
 /**
- * The catalog the probes and the quality table make: every provider that answered, every model
- * it listed. Its base_url is the directory's own path (/p/<id>), never joined to the env URL:
- * the env's origin differs between a live pass and its replay, and the catalog is part of the
- * state export a replay must reproduce byte for byte.
+ * The catalog the probes and the quality table make: every provider that answered,
+ * every model it listed. Its base_url is the directory's own path (/p/<id>), never
+ * joined onto the env URL: the env's origin differs between a live pass and its
+ * replay, and the catalog is part of the state export a replay must reproduce
+ * byte for byte.
  */
-function buildCatalog(probeList: readonly Probe[]): CatalogReport {
-  const providers: CatalogProvider[] = [];
-  for (const probe of probeList) {
-    if (!probe.ok) continue;
-    const seen = new Set<string>();
-    const models: CatalogModel[] = [];
-    for (const model of [...probe.models].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
-      if (seen.has(model.id)) continue;
-      seen.add(model.id);
-      const row = ratingRow(probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelIsFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
+function assembleCatalog(probeList: readonly ProbeResult[]): Catalog {
+  const providers: CatalogedProvider[] = [];
+  for (const result of probeList) {
+    if (!result.ok) continue;
+    const emitted = new Set<string>();
+    const entries: ModelEntry[] = [];
+    for (const model of [...result.models].sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0))) {
+      if (emitted.has(model.id)) continue;
+      emitted.add(model.id);
+      const row = ratingFor(result.provider.id, model.id);
+      entries.push({ id: model.id, free: isFreeModel(model, row), context_length: row?.context_length ?? model.context_length ?? null });
     }
-    providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
+    providers.push({ id: result.provider.id, base_url: result.provider.basePath, key_env: result.provider.keyEnv, wire: result.provider.wire, models: entries });
   }
   return { providers };
 }
 
 /** Probe every provider and build the one catalog (the `--list` document and the register body). */
-async function load(): Promise<void> {
-  if (brief.error !== null) log(brief.error);
-  probes = await Promise.all(brief.providers.map((provider) => probeProvider(ENV_URL, provider)));
-  for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
-  catalog = buildCatalog(probes);
+async function probeAll(): Promise<void> {
+  if (briefing.error !== null) note(briefing.error);
+  probeResults = await Promise.all(briefing.providers.map((entry) => probeOneProvider(ENV_ORIGIN, entry)));
+  probeResults.forEach((result) => {
+    if (!result.ok && result.error !== null) note(result.error);
+  });
+  registry = assembleCatalog(probeResults);
 }
 
 // ---------------------------------------------------------------------------
-// The planner: assign manifest requests to providers before serving, and
-// re-plan what is left whenever a provider drops.
+// The planner: assign manifest rows to providers before serving, and re-plan
+// what is left whenever a provider drops.
 // ---------------------------------------------------------------------------
 
 /** Whether a quality row's capabilities meet one request's requirements. */
-function rowMeets(requires: Requirement, row: RatingRow): boolean {
+function satisfies(requires: RequestNeeds, row: Rating): boolean {
   if (requires.tools === true && !row.tools) return false;
   if (requires.vision === true && !row.vision) return false;
   if (requires.json === true && !row.json) return false;
@@ -479,30 +499,30 @@ function rowMeets(requires: Requirement, row: RatingRow): boolean {
  * carry JSON mode. Only models with a quality-table row count — an unrated model
  * is not a candidate, because its quality is unknown.
  */
-function bestModelFor(provider: ProviderEntry, probe: Probe, request: WorkloadRequest): RatingRow | null {
+function bestFreeModel(provider: Provider, probe: ProbeResult, request: ManifestRow): Rating | null {
   if (request.api === 'openai' && request.requires.json === true && provider.wire === 'anthropic') return null;
-  let best: RatingRow | null = null;
-  for (const model of probe.models) {
-    const row = ratingRow(provider.id, model.id);
+  let top: Rating | null = null;
+  for (const listed of probe.models) {
+    const row = ratingFor(provider.id, listed.id);
     if (row === null || !row.free) continue;
-    if (!rowMeets(request.requires, row)) continue;
-    if (best === null || row.rating_milli > best.rating_milli) best = row;
+    if (!satisfies(request.requires, row)) continue;
+    if (top === null || row.rating > top.rating) top = row;
   }
-  return best;
+  return top;
 }
 
 /** The probe for one provider, when it answered. */
-function probeOf(providerId: string): Probe | null {
-  return probes.find((p) => p.provider.id === providerId && p.ok) ?? null;
+function probeFor(providerId: string): ProbeResult | null {
+  return probeResults.find((result) => result.provider.id === providerId && result.ok) ?? null;
 }
 
 /**
- * The chance that a provider's n-th call of the trial is refused, from its budget
- * range alone. Call 1 never fails. From call 2 on: the budget may be spent (the
- * drawn budget is under n), the call number may be one of the provider's scheduled
- * failures, or the provider may be the trial's one outage provider and already
- * down (one provider in ten, down from a call number drawn the same way). The
- * budget is uniform over the range, so each term averages over it.
+ * The chance that a provider's callNo-th call of the trial is refused, from its
+ * budget range alone. Call 1 never fails. From call 2 on: the budget may be spent
+ * (the drawn budget is under callNo), the call number may be one of the provider's
+ * scheduled failures, or the provider may be the trial's one outage provider and
+ * already down (one provider in ten, down from a call number drawn the same way).
+ * The budget is uniform over the range, so each term averages over it.
  *
  * The scheduled-failure term is corrected for the forced second call: every trial
  * forces exactly one provider (one in ten) to fail its second call, on top of its
@@ -511,178 +531,181 @@ function probeOf(providerId: string): Probe | null {
  * fail-call slot left for calls 3 and up, which lowers those calls' natural rate
  * a touch. v2's model used the natural rate for every call and undercounted call 2.
  */
-function failChance(providerId: string, n: number): number {
-  if (n <= 1) return 0;
-  const [min, max] = BUDGET_RANGES[providerId] ?? DEFAULT_BUDGET_RANGE;
-  const span = max - min + 1;
-  let chance = 0;
-  for (let budget = min; budget <= max; budget++) {
-    const weight = 1 / span;
-    if (n > budget) {
-      chance += weight;
+function refusalChance(providerId: string, callNo: number): number {
+  if (callNo <= 1) return 0;
+  const [lo, hi] = PROVIDER_BUDGET_RANGES[providerId] ?? FALLBACK_BUDGET_RANGE;
+  const range = hi - lo + 1;
+  let total = 0;
+  for (let drawn = lo; drawn <= hi; drawn++) {
+    const share = 1 / range;
+    if (callNo > drawn) {
+      total += share;
       continue;
     }
-    if (n === 2) {
-      chance += weight * (0.1 + 0.9 * (1.5 / (budget - 2)));
-    } else if (n <= budget - 1) {
-      chance += weight * (0.1 * (0.5 / Math.max(1, budget - 3)) + 0.9 * (1.5 / (budget - 2)));
+    if (callNo === 2) {
+      total += share * (0.1 + 0.9 * (1.5 / (drawn - 2)));
+    } else if (callNo <= drawn - 1) {
+      total += share * (0.1 * (0.5 / Math.max(1, drawn - 3)) + 0.9 * (1.5 / (drawn - 2)));
     }
-    chance += weight * 0.1 * Math.min(1, Math.max(0, (n - 1) / (budget - 2)));
+    total += share * 0.1 * Math.min(1, Math.max(0, (callNo - 1) / (drawn - 2)));
   }
-  return Math.min(0.999, chance);
+  return Math.min(0.999, total);
 }
 
-/** The expected failed calls from making k calls on one provider. */
-function expectedFailures(providerId: string, k: number): number {
+/** The expected refused calls from making k calls on one provider. */
+function expectedRefusals(providerId: string, calls: number): number {
   let total = 0;
-  for (let n = 2; n <= k; n++) total += failChance(providerId, n);
+  for (let callNo = 2; callNo <= calls; callNo++) total += refusalChance(providerId, callNo);
   return total;
 }
 
-interface PlannedRequest {
+interface PlannedRow {
   providerId: string | null;
-  model: string | null;
+  modelId: string | null;
   rating: number;
-  bestRating: number;
+  topRating: number;
 }
 
 /**
- * Plan a set of requests: one provider per request, minimising the expected failed
- * calls subject to a quality-loss budget. The plan starts quality-optimal over the
- * providers still standing (every request on its best-rated free model among them)
- * and then takes, until none is left, the move that cuts expected failures most per
- * milli of quality lost — a move that also improves quality is taken first.
- * Deterministic: requests and providers are scanned in fixed order, and a move
- * only wins on a strict improvement.
+ * Plan a set of rows: one provider per row, minimising the expected refused calls
+ * subject to a quality-loss budget. The plan starts quality-optimal over the
+ * providers still standing (every row on its best-rated free model among them)
+ * and then takes, until none is left, the move that cuts expected refusals most
+ * per milli of quality lost — a move that also improves quality is taken first.
+ * Deterministic: rows and providers are scanned in fixed order, and a move only
+ * wins on a strict improvement.
  *
- * `baseCounts` are the calls already made on each provider (zero for the initial
- * plan); the cost of an assignment counts the marginal failures of the calls it
- * adds on top of those. `dropped` excludes providers that are done for the trial.
- * Loss is always measured against the GLOBAL best rating — the best model on any
- * probed provider, dropped or not — because that is what the quality score pays
- * on. So a re-plan's starting loss is not zero when the best provider has dropped:
- * it is the loss the best still-standing assignment already carries.
+ * `startingCounts` are the calls already made on each provider (zero for the
+ * opening plan); the cost of an assignment counts the marginal refusals of the
+ * calls it adds on top of those. `excluded` leaves out providers that are done
+ * for the trial. Loss is always measured against the GLOBAL best rating — the
+ * best model on any probed provider, dropped or not — because that is what the
+ * quality score pays on. So a re-plan's starting loss is not zero when the best
+ * provider has dropped: it is the loss the best still-standing assignment
+ * already carries.
  */
-function computePlanFor(
-  requests: WorkloadRequest[],
-  baseCounts: ReadonlyMap<string, number>,
-  dropped: ReadonlySet<string>,
+function planRequests(
+  rows: ManifestRow[],
+  startingCounts: ReadonlyMap<string, number>,
+  excluded: ReadonlySet<string>,
   lossBudget: number,
-): PlannedRequest[] {
-  const assignment: PlannedRequest[] = requests.map((request) => {
-    let best: PlannedRequest = { providerId: null, model: null, rating: -1, bestRating: -1 };
-    for (const provider of brief.providers) {
-      const probe = probeOf(provider.id);
+): PlannedRow[] {
+  const slots: PlannedRow[] = rows.map((request) => {
+    let top: PlannedRow = { providerId: null, modelId: null, rating: -1, topRating: -1 };
+    for (const entry of briefing.providers) {
+      const probe = probeFor(entry.id);
       if (probe === null) continue;
-      const row = bestModelFor(provider, probe, request);
+      const row = bestFreeModel(entry, probe, request);
       if (row === null) continue;
-      if (row.rating_milli > best.bestRating) best.bestRating = row.rating_milli;
-      if (dropped.has(provider.id)) continue;
-      if (row.rating_milli > best.rating) best = { providerId: provider.id, model: row.model, rating: row.rating_milli, bestRating: best.bestRating };
+      if (row.rating > top.topRating) top.topRating = row.rating;
+      if (excluded.has(entry.id)) continue;
+      if (row.rating > top.rating) top = { providerId: entry.id, modelId: row.model, rating: row.rating, topRating: top.topRating };
     }
-    if (best.providerId === null) best.bestRating = Math.max(0, best.bestRating);
-    return best;
+    if (top.providerId === null) top.topRating = Math.max(0, top.topRating);
+    return top;
   });
-  const counts = new Map<string, number>();
-  for (const provider of brief.providers) counts.set(provider.id, baseCounts.get(provider.id) ?? 0);
-  for (const slot of assignment) if (slot.providerId !== null) counts.set(slot.providerId, (counts.get(slot.providerId) ?? 0) + 1);
+  const tally = new Map<string, number>();
+  for (const entry of briefing.providers) tally.set(entry.id, startingCounts.get(entry.id) ?? 0);
+  for (const cell of slots) if (cell.providerId !== null) tally.set(cell.providerId, (tally.get(cell.providerId) ?? 0) + 1);
   // The starting loss is the loss of the quality-optimal-over-survivors start,
-  // measured against the global best — zero for the initial plan, positive for a
+  // measured against the global best — zero for the opening plan, positive for a
   // re-plan when the best provider has dropped.
-  let loss = assignment.reduce((sum, slot, i) => {
-    if (slot.providerId === null || slot.rating < 0) return sum;
-    return sum + requests[i].weight * (slot.bestRating - slot.rating);
-  }, 0);
-  for (;;) {
-    let bestMove: { index: number; providerId: string; model: string; rating: number; dLoss: number; dCost: number; ratio: number } | null = null;
-    for (let i = 0; i < assignment.length; i++) {
-      const slot = assignment[i];
-      if (slot.providerId === null) continue;
-      const request = requests[i];
-      for (const provider of brief.providers) {
-        if (provider.id === slot.providerId || dropped.has(provider.id)) continue;
-        const probe = probeOf(provider.id);
+  let lossSoFar = 0;
+  for (let k = 0; k < slots.length; k++) {
+    const cell = slots[k];
+    if (cell.providerId === null || cell.rating < 0) continue;
+    lossSoFar += rows[k].weight * (cell.topRating - cell.rating);
+  }
+  while (true) {
+    let topMove: { index: number; providerId: string; model: string; rating: number; lossDelta: number; costDelta: number; ratio: number } | null = null;
+    for (let k = 0; k < slots.length; k++) {
+      const cell = slots[k];
+      if (cell.providerId === null) continue;
+      const request = rows[k];
+      for (const entry of briefing.providers) {
+        if (entry.id === cell.providerId || excluded.has(entry.id)) continue;
+        const probe = probeFor(entry.id);
         if (probe === null) continue;
-        const row = bestModelFor(provider, probe, request);
+        const row = bestFreeModel(entry, probe, request);
         if (row === null) continue;
-        const dLoss = request.weight * (slot.rating - row.rating_milli);
-        if (loss + dLoss > lossBudget) continue;
-        const fromCount = counts.get(slot.providerId) ?? 0;
-        const toCount = counts.get(provider.id) ?? 0;
-        const dCost = (expectedFailures(provider.id, toCount + 1) - expectedFailures(provider.id, toCount)) - (expectedFailures(slot.providerId, fromCount) - expectedFailures(slot.providerId, fromCount - 1));
-        if (dCost >= -1e-9) continue;
-        const ratio = dLoss <= 0 ? 1e9 + -dCost : -dCost / dLoss;
-        if (bestMove === null || ratio > bestMove.ratio || (ratio === bestMove.ratio && -dCost > -bestMove.dCost)) {
-          bestMove = { index: i, providerId: provider.id, model: row.model, rating: row.rating_milli, dLoss, dCost, ratio };
+        const lossDelta = request.weight * (cell.rating - row.rating);
+        if (lossSoFar + lossDelta > lossBudget) continue;
+        const sourceCount = tally.get(cell.providerId) ?? 0;
+        const targetCount = tally.get(entry.id) ?? 0;
+        const costDelta = (expectedRefusals(entry.id, targetCount + 1) - expectedRefusals(entry.id, targetCount)) - (expectedRefusals(cell.providerId, sourceCount) - expectedRefusals(cell.providerId, sourceCount - 1));
+        if (costDelta >= -1e-9) continue;
+        const ratio = lossDelta <= 0 ? 1e9 + -costDelta : -costDelta / lossDelta;
+        if (topMove === null || ratio > topMove.ratio || (ratio === topMove.ratio && -costDelta > -topMove.costDelta)) {
+          topMove = { index: k, providerId: entry.id, model: row.model, rating: row.rating, lossDelta, costDelta, ratio };
         }
       }
     }
-    if (bestMove === null) break;
-    const slot = assignment[bestMove.index];
-    counts.set(slot.providerId as string, (counts.get(slot.providerId as string) ?? 0) - 1);
-    counts.set(bestMove.providerId, (counts.get(bestMove.providerId) ?? 0) + 1);
-    slot.providerId = bestMove.providerId;
-    slot.model = bestMove.model;
-    slot.rating = bestMove.rating;
-    loss += bestMove.dLoss;
+    if (topMove === null) break;
+    const cell = slots[topMove.index];
+    tally.set(cell.providerId as string, (tally.get(cell.providerId as string) ?? 0) - 1);
+    tally.set(topMove.providerId, (tally.get(topMove.providerId) ?? 0) + 1);
+    cell.providerId = topMove.providerId;
+    cell.modelId = topMove.model;
+    cell.rating = topMove.rating;
+    lossSoFar += topMove.lossDelta;
   }
-  const totalCost = brief.providers.reduce((sum, p) => sum + expectedFailures(p.id, counts.get(p.id) ?? 0), 0);
-  const countsText = brief.providers.map((p) => `${p.id}=${counts.get(p.id) ?? 0}`).join(' ');
-  log(`plan: ${assignment.length} requests, planned loss ${loss} milli, expected failures ${totalCost.toFixed(2)} (${countsText})`);
-  return assignment;
+  const expectedTotal = briefing.providers.reduce((sum, entry) => sum + expectedRefusals(entry.id, tally.get(entry.id) ?? 0), 0);
+  const countsSummary = briefing.providers.map((entry) => `${entry.id}=${tally.get(entry.id) ?? 0}`).join(' ');
+  note(`planned ${slots.length} rows: loss ${lossSoFar} milli, expected refusals ${expectedTotal.toFixed(2)} [${countsSummary}]`);
+  return slots;
 }
 
-/** The initial plan: the whole manifest, no calls made yet, nobody dropped. */
-function computePlan(): PlannedRequest[] {
-  const baseCounts = new Map<string, number>();
-  for (const provider of brief.providers) baseCounts.set(provider.id, 0);
-  return computePlanFor(brief.manifest, baseCounts, new Set<string>(), LOSS_BUDGET_MILLI);
+/** The opening plan: the whole manifest, no calls made yet, nobody dropped. */
+function initialPlan(): PlannedRow[] {
+  const startingCounts = new Map<string, number>();
+  for (const entry of briefing.providers) startingCounts.set(entry.id, 0);
+  return planRequests(briefing.manifest, startingCounts, new Set<string>(), INITIAL_LOSS_BUDGET);
 }
 
 /**
  * Re-plan the manifest rows from `fromIndex` on, after a provider dropped. The
- * remaining budget is the re-plan ceiling minus the loss already committed by
- * served requests, floored at zero; the base counts are the calls made so far.
- * Rows already served keep their assignments. A pure function of the trial state
- * so far, so a replay re-plans identically.
+ * remaining budget is the re-plan ceiling less the loss already booked by served
+ * rows, floored at zero; the base counts are the calls made so far. Rows already
+ * served keep their assignments. A pure function of the trial state so far, so a
+ * replay re-plans identically.
  */
-function replanFrom(fromIndex: number): void {
-  if (fromIndex >= brief.manifest.length) return;
-  const baseCounts = new Map<string, number>();
-  const dropped = new Set<string>();
-  for (const provider of brief.providers) {
-    baseCounts.set(provider.id, stateOf(provider.id).calls);
-    if (stateOf(provider.id).dropped) dropped.add(provider.id);
+function replanAfter(fromIndex: number): void {
+  if (fromIndex >= briefing.manifest.length) return;
+  const startingCounts = new Map<string, number>();
+  const excluded = new Set<string>();
+  for (const entry of briefing.providers) {
+    startingCounts.set(entry.id, stateFor(entry.id).calls);
+    if (stateFor(entry.id).dropped) excluded.add(entry.id);
   }
-  const remainingBudget = Math.max(0, REPLAN_BUDGET_MILLI - committedLoss);
-  log(`replan: from row ${fromIndex}, committed loss ${committedLoss} milli, remaining budget ${remainingBudget} milli`);
-  const fresh = computePlanFor(brief.manifest.slice(fromIndex), baseCounts, dropped, remainingBudget);
-  for (let i = 0; i < fresh.length; i++) plan[fromIndex + i] = fresh[i];
+  const budgetLeft = Math.max(0, REPLAN_LOSS_CEILING - lossCommitted);
+  note(`re-planning from row ${fromIndex}: loss booked ${lossCommitted} milli, budget left ${budgetLeft} milli`);
+  const newPlan = planRequests(briefing.manifest.slice(fromIndex), startingCounts, excluded, budgetLeft);
+  for (let k = 0; k < newPlan.length; k++) assignments[fromIndex + k] = newPlan[k];
 }
 
 // ---------------------------------------------------------------------------
 // The normalized request: one view of a client body, in either wire.
 // ---------------------------------------------------------------------------
 
-type ImageRef = { kind: 'base64'; data: string; mediaType: string } | { kind: 'url'; url: string };
+type Image = { kind: 'base64'; data: string; mediaType: string } | { kind: 'url'; url: string };
 
-interface ViewMessage {
+interface MessageView {
   role: 'user' | 'assistant' | 'tool';
   text: string;
-  image: ImageRef | null;
+  image: Image | null;
   toolCallId: string | null;
 }
 
-interface ViewTool {
+interface ToolView {
   name: string;
   description: string;
-  parameters: Json;
+  parameters: JsonObject;
 }
 
-interface RequestView {
+interface NormalizedRequest {
   systemText: string;
-  messages: ViewMessage[];
-  tools: ViewTool[];
+  messages: MessageView[];
+  tools: ToolView[];
   maxTokens: number | null;
   stops: string[];
   jsonMode: boolean;
@@ -692,136 +715,146 @@ interface RequestView {
 }
 
 /** The text of a string or of a block array's text blocks, joined the way the providers join them. */
-function textOf(content: unknown): string {
+function textFrom(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
-  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
+  return content.flatMap((block) => (isJsonObject(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : [])).join('\n');
 }
 
 /** The image a content block array carries, if any (the last one wins, as the providers read it). */
-function imageOf(content: unknown): ImageRef | null {
+function imageFrom(content: unknown): Image | null {
   if (!Array.isArray(content)) return null;
-  let found: ImageRef | null = null;
+  let seen: Image | null = null;
   for (const block of content) {
-    if (!isRecord(block)) continue;
-    if (block.type === 'image_url' && isRecord(block.image_url) && typeof block.image_url.url === 'string') {
+    if (!isJsonObject(block)) continue;
+    if (block.type === 'image_url' && isJsonObject(block.image_url) && typeof block.image_url.url === 'string') {
       const url = block.image_url.url;
-      const data = /^data:([^,]*);base64,(.*)$/s.exec(url);
-      if (data !== null) found = { kind: 'base64', data: data[2], mediaType: data[1] !== '' ? data[1] : 'image/png' };
-      else found = { kind: 'url', url };
-    } else if (block.type === 'image' && isRecord(block.source)) {
-      const source = block.source;
-      if (source.type === 'base64' && typeof source.data === 'string') {
-        found = { kind: 'base64', data: source.data, mediaType: typeof source.media_type === 'string' ? source.media_type : 'image/png' };
-      } else if (source.type === 'url' && typeof source.url === 'string') {
-        found = { kind: 'url', url: source.url };
+      const match = /^data:([^,]*);base64,(.*)$/s.exec(url);
+      if (match !== null) seen = { kind: 'base64', data: match[2], mediaType: match[1] !== '' ? match[1] : 'image/png' };
+      else seen = { kind: 'url', url };
+    } else if (block.type === 'image' && isJsonObject(block.source)) {
+      const src = block.source;
+      if (src.type === 'base64' && typeof src.data === 'string') {
+        seen = { kind: 'base64', data: src.data, mediaType: typeof src.media_type === 'string' ? src.media_type : 'image/png' };
+      } else if (src.type === 'url' && typeof src.url === 'string') {
+        seen = { kind: 'url', url: src.url };
       }
     }
   }
-  return found;
+  return seen;
 }
 
 /** A tool_result block's content as text. */
-function toolResultText(content: unknown): string {
+function toolText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    const text = textOf(content);
+    const text = textFrom(content);
     return text !== '' ? text : JSON.stringify(content);
   }
   return content === undefined ? '' : JSON.stringify(content);
 }
 
-function stringListOf(v: unknown): string[] {
+function stringListFrom(v: unknown): string[] {
   if (typeof v === 'string') return [v];
   if (!Array.isArray(v)) return [];
-  return v.filter((x): x is string => typeof x === 'string');
+  return v.filter((item): item is string => typeof item === 'string');
 }
 
 /** An OpenAI Chat Completions body as the normalized view. */
-function viewFromOpenAI(body: Json): RequestView {
-  const systemParts: string[] = [];
-  const messages: ViewMessage[] = [];
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    if (raw.role === 'system') {
-      const text = textOf(raw.content);
-      if (text !== '') systemParts.push(text);
+function openAIToView(incoming: JsonObject): NormalizedRequest {
+  const systemLines: string[] = [];
+  const messages: MessageView[] = [];
+  const rawMessages = Array.isArray(incoming.messages) ? incoming.messages : [];
+  for (const item of rawMessages) {
+    if (!isJsonObject(item)) continue;
+    if (item.role === 'system') {
+      const text = textFrom(item.content);
+      if (text !== '') systemLines.push(text);
       continue;
     }
-    if (raw.role === 'tool') {
-      messages.push({ role: 'tool', text: typeof raw.content === 'string' ? raw.content : textOf(raw.content), image: null, toolCallId: typeof raw.tool_call_id === 'string' ? raw.tool_call_id : null });
+    if (item.role === 'tool') {
+      messages.push({
+        role: 'tool',
+        text: typeof item.content === 'string' ? item.content : textFrom(item.content),
+        image: null,
+        toolCallId: typeof item.tool_call_id === 'string' ? item.tool_call_id : null,
+      });
       continue;
     }
-    if (raw.role === 'assistant' || raw.role === 'user') {
-      messages.push({ role: raw.role, text: textOf(raw.content), image: raw.role === 'user' ? imageOf(raw.content) : null, toolCallId: null });
+    if (item.role === 'assistant' || item.role === 'user') {
+      messages.push({ role: item.role, text: textFrom(item.content), image: item.role === 'user' ? imageFrom(item.content) : null, toolCallId: null });
     }
   }
-  const tools: ViewTool[] = [];
-  if (Array.isArray(body.tools)) {
-    for (const raw of body.tools) {
-      if (!isRecord(raw) || !isRecord(raw.function) || typeof raw.function.name !== 'string') continue;
+  const tools: ToolView[] = [];
+  if (Array.isArray(incoming.tools)) {
+    for (const item of incoming.tools) {
+      if (!isJsonObject(item) || !isJsonObject(item.function) || typeof item.function.name !== 'string') continue;
       tools.push({
-        name: raw.function.name,
-        description: typeof raw.function.description === 'string' ? raw.function.description : '',
-        parameters: isRecord(raw.function.parameters) ? raw.function.parameters : { type: 'object', properties: {} },
+        name: item.function.name,
+        description: typeof item.function.description === 'string' ? item.function.description : '',
+        parameters: isJsonObject(item.function.parameters) ? item.function.parameters : { type: 'object', properties: {} },
       });
     }
   }
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
+  const responseFormat = isJsonObject(incoming.response_format) ? incoming.response_format.type : undefined;
   return {
-    systemText: systemParts.join('\n'),
+    systemText: systemLines.join('\n'),
     messages,
     tools,
-    maxTokens: numberOrNull(body.max_tokens) ?? numberOrNull(body.max_completion_tokens),
-    stops: stringListOf(body.stop),
-    jsonMode: format === 'json_object' || format === 'json_schema',
-    temperature: numberOrNull(body.temperature),
-    topP: numberOrNull(body.top_p),
-    stream: body.stream === true,
+    maxTokens: asNumberOrNull(incoming.max_tokens) ?? asNumberOrNull(incoming.max_completion_tokens),
+    stops: stringListFrom(incoming.stop),
+    jsonMode: responseFormat === 'json_object' || responseFormat === 'json_schema',
+    temperature: asNumberOrNull(incoming.temperature),
+    topP: asNumberOrNull(incoming.top_p),
+    stream: incoming.stream === true,
   };
 }
 
 /** An Anthropic Messages body as the normalized view. */
-function viewFromAnthropic(body: Json): RequestView {
-  const systemText = textOf(body.system);
-  const messages: ViewMessage[] = [];
-  const source = Array.isArray(body.messages) ? body.messages : [];
-  for (const raw of source) {
-    if (!isRecord(raw)) continue;
-    const content = raw.content;
+function anthropicToView(incoming: JsonObject): NormalizedRequest {
+  const systemText = textFrom(incoming.system);
+  const messages: MessageView[] = [];
+  const rawMessages = Array.isArray(incoming.messages) ? incoming.messages : [];
+  for (const item of rawMessages) {
+    if (!isJsonObject(item)) continue;
+    const content = item.content;
     if (typeof content === 'string') {
-      messages.push({ role: raw.role === 'assistant' ? 'assistant' : 'user', text: content, image: null, toolCallId: null });
+      messages.push({ role: item.role === 'assistant' ? 'assistant' : 'user', text: content, image: null, toolCallId: null });
       continue;
     }
     if (!Array.isArray(content)) continue;
-    if (raw.role === 'assistant') {
-      messages.push({ role: 'assistant', text: textOf(content), image: null, toolCallId: null });
+    if (item.role === 'assistant') {
+      messages.push({ role: 'assistant', text: textFrom(content), image: null, toolCallId: null });
       continue;
     }
     // A user turn: tool_result blocks become tool messages, the rest one user message.
-    const parts: string[] = [];
-    let image: ImageRef | null = null;
+    const textParts: string[] = [];
+    let image: Image | null = null;
     for (const block of content) {
-      if (!isRecord(block)) continue;
+      if (!isJsonObject(block)) continue;
       if (block.type === 'tool_result') {
-        messages.push({ role: 'tool', text: toolResultText(block.content), image: null, toolCallId: typeof block.tool_use_id === 'string' ? block.tool_use_id : null });
+        messages.push({
+          role: 'tool',
+          text: toolText(block.content),
+          image: null,
+          toolCallId: typeof block.tool_use_id === 'string' ? block.tool_use_id : null,
+        });
         continue;
       }
-      if (block.type === 'text' && typeof block.text === 'string') parts.push(block.text);
-      const found = imageOf([block]);
-      if (found !== null) image = found;
+      if (block.type === 'text' && typeof block.text === 'string') textParts.push(block.text);
+      const seen = imageFrom([block]);
+      if (seen !== null) image = seen;
     }
-    if (parts.length > 0 || image !== null) messages.push({ role: 'user', text: parts.join('\n'), image, toolCallId: null });
+    if (textParts.length > 0 || image !== null) messages.push({ role: 'user', text: textParts.join('\n'), image, toolCallId: null });
   }
-  const tools: ViewTool[] = [];
-  if (Array.isArray(body.tools)) {
-    for (const raw of body.tools) {
-      if (!isRecord(raw) || typeof raw.name !== 'string') continue;
+  const tools: ToolView[] = [];
+  if (Array.isArray(incoming.tools)) {
+    for (const item of incoming.tools) {
+      if (!isJsonObject(item) || typeof item.name !== 'string') continue;
       tools.push({
-        name: raw.name,
-        description: typeof raw.description === 'string' ? raw.description : '',
-        parameters: isRecord(raw.input_schema) ? raw.input_schema : { type: 'object', properties: {} },
+        name: item.name,
+        description: typeof item.description === 'string' ? item.description : '',
+        parameters: isJsonObject(item.input_schema) ? item.input_schema : { type: 'object', properties: {} },
       });
     }
   }
@@ -829,12 +862,12 @@ function viewFromAnthropic(body: Json): RequestView {
     systemText,
     messages,
     tools,
-    maxTokens: numberOrNull(body.max_tokens),
-    stops: stringListOf(body.stop_sequences),
+    maxTokens: asNumberOrNull(incoming.max_tokens),
+    stops: stringListFrom(incoming.stop_sequences),
     jsonMode: false,
-    temperature: numberOrNull(body.temperature),
-    topP: numberOrNull(body.top_p),
-    stream: body.stream === true,
+    temperature: asNumberOrNull(incoming.temperature),
+    topP: asNumberOrNull(incoming.top_p),
+    stream: incoming.stream === true,
   };
 }
 
@@ -843,168 +876,178 @@ function viewFromAnthropic(body: Json): RequestView {
 // ---------------------------------------------------------------------------
 
 /** The system prompt's role as one provider expects it, and the tools it uses. */
-function viewToOpenAI(view: RequestView, model: string): Json {
-  const messages: Json[] = [];
-  if (view.systemText !== '') messages.push({ role: 'system', content: view.systemText });
-  for (const message of view.messages) {
-    if (message.role === 'tool') {
-      messages.push({ role: 'tool', content: message.text, tool_call_id: message.toolCallId ?? '' });
+function viewAsOpenAI(request: NormalizedRequest, model: string): JsonObject {
+  const messages: JsonObject[] = [];
+  if (request.systemText !== '') messages.push({ role: 'system', content: request.systemText });
+  for (const msg of request.messages) {
+    if (msg.role === 'tool') {
+      messages.push({ role: 'tool', content: msg.text, tool_call_id: msg.toolCallId ?? '' });
       continue;
     }
-    if (message.role === 'assistant') {
-      messages.push({ role: 'assistant', content: message.text });
+    if (msg.role === 'assistant') {
+      messages.push({ role: 'assistant', content: msg.text });
       continue;
     }
-    const content: Json[] = [];
-    if (message.image !== null) {
-      if (message.image.kind === 'base64') {
-        content.push({ type: 'image_url', image_url: { url: `data:${message.image.mediaType};base64,${message.image.data}` } });
+    const blocks: JsonObject[] = [];
+    if (msg.image !== null) {
+      if (msg.image.kind === 'base64') {
+        blocks.push({ type: 'image_url', image_url: { url: `data:${msg.image.mediaType};base64,${msg.image.data}` } });
       } else {
-        content.push({ type: 'image_url', image_url: { url: message.image.url } });
+        blocks.push({ type: 'image_url', image_url: { url: msg.image.url } });
       }
     }
-    if (message.text !== '') content.push({ type: 'text', text: message.text });
-    messages.push({ role: 'user', content });
+    if (msg.text !== '') blocks.push({ type: 'text', text: msg.text });
+    messages.push({ role: 'user', content: blocks });
   }
-  const body: Json = { model, messages, stream: false };
-  if (view.tools.length > 0) {
-    body.tools = view.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }));
+  const payload: JsonObject = { model, messages, stream: false };
+  if (request.tools.length > 0) {
+    payload.tools = request.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } }));
   }
-  if (view.maxTokens !== null) body.max_tokens = view.maxTokens;
-  if (view.stops.length > 0) body.stop = view.stops;
-  if (view.jsonMode) body.response_format = { type: 'json_object' };
-  if (view.temperature !== null) body.temperature = view.temperature;
-  if (view.topP !== null) body.top_p = view.topP;
-  return body;
+  if (request.maxTokens !== null) payload.max_tokens = request.maxTokens;
+  if (request.stops.length > 0) payload.stop = request.stops;
+  if (request.jsonMode) payload.response_format = { type: 'json_object' };
+  if (request.temperature !== null) payload.temperature = request.temperature;
+  if (request.topP !== null) payload.top_p = request.topP;
+  return payload;
 }
 
-function viewToAnthropic(view: RequestView, model: string): Json {
-  const messages: Json[] = [];
-  for (const message of view.messages) {
-    if (message.role === 'tool') {
-      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: message.toolCallId ?? '', content: message.text }] });
+function viewAsAnthropic(request: NormalizedRequest, model: string): JsonObject {
+  const messages: JsonObject[] = [];
+  for (const msg of request.messages) {
+    if (msg.role === 'tool') {
+      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: msg.toolCallId ?? '', content: msg.text }] });
       continue;
     }
-    if (message.role === 'assistant') {
-      messages.push({ role: 'assistant', content: message.text });
+    if (msg.role === 'assistant') {
+      messages.push({ role: 'assistant', content: msg.text });
       continue;
     }
-    const content: Json[] = [];
-    if (message.image !== null) {
-      if (message.image.kind === 'base64') {
-        content.push({ type: 'image', source: { type: 'base64', media_type: message.image.mediaType, data: message.image.data } });
+    const blocks: JsonObject[] = [];
+    if (msg.image !== null) {
+      if (msg.image.kind === 'base64') {
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: msg.image.mediaType, data: msg.image.data } });
       } else {
-        content.push({ type: 'image', source: { type: 'url', url: message.image.url } });
+        blocks.push({ type: 'image', source: { type: 'url', url: msg.image.url } });
       }
     }
-    if (message.text !== '') content.push({ type: 'text', text: message.text });
-    messages.push({ role: 'user', content });
+    if (msg.text !== '') blocks.push({ type: 'text', text: msg.text });
+    messages.push({ role: 'user', content: blocks });
   }
-  const body: Json = { model, messages, stream: false, max_tokens: view.maxTokens ?? 1024 };
-  if (view.systemText !== '') body.system = view.systemText;
-  if (view.tools.length > 0) {
-    body.tools = view.tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }));
+  const payload: JsonObject = { model, messages, stream: false, max_tokens: request.maxTokens ?? 1024 };
+  if (request.systemText !== '') payload.system = request.systemText;
+  if (request.tools.length > 0) {
+    payload.tools = request.tools.map((tool) => ({ name: tool.name, description: tool.description, input_schema: tool.parameters }));
   }
-  if (view.stops.length > 0) body.stop_sequences = view.stops;
-  if (view.temperature !== null) body.temperature = view.temperature;
-  if (view.topP !== null) body.top_p = view.topP;
-  return body;
+  if (request.stops.length > 0) payload.stop_sequences = request.stops;
+  if (request.temperature !== null) payload.temperature = request.temperature;
+  if (request.topP !== null) payload.top_p = request.topP;
+  return payload;
 }
 
-function viewToGemini(view: RequestView, model: string): Json {
-  const contents: Json[] = [];
-  for (const message of view.messages) {
-    if (message.role === 'tool') continue;
-    const parts: Json[] = [];
-    if (message.image !== null) {
-      if (message.image.kind === 'base64') {
-        parts.push({ inlineData: { mimeType: message.image.mediaType, data: message.image.data } });
+function viewAsGemini(request: NormalizedRequest, model: string): JsonObject {
+  const contents: JsonObject[] = [];
+  for (const msg of request.messages) {
+    if (msg.role === 'tool') continue;
+    const parts: JsonObject[] = [];
+    if (msg.image !== null) {
+      if (msg.image.kind === 'base64') {
+        parts.push({ inlineData: { mimeType: msg.image.mediaType, data: msg.image.data } });
       } else {
-        parts.push({ fileData: { mimeType: 'image/png', fileUri: message.image.url } });
+        parts.push({ fileData: { mimeType: 'image/png', fileUri: msg.image.url } });
       }
     }
-    if (message.text !== '') parts.push({ text: message.text });
+    if (msg.text !== '') parts.push({ text: msg.text });
     if (parts.length === 0) continue;
-    contents.push({ role: message.role === 'assistant' ? 'model' : 'user', parts });
+    contents.push({ role: msg.role === 'assistant' ? 'model' : 'user', parts });
   }
-  const body: Json = { contents };
-  if (view.systemText !== '') body.systemInstruction = { parts: [{ text: view.systemText }] };
-  if (view.tools.length > 0) {
-    body.tools = [{ functionDeclarations: view.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })) }];
+  const payload: JsonObject = { contents };
+  if (request.systemText !== '') payload.systemInstruction = { parts: [{ text: request.systemText }] };
+  if (request.tools.length > 0) {
+    payload.tools = [{ functionDeclarations: request.tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })) }];
   }
-  const config: Json = {};
-  if (view.maxTokens !== null) config.maxOutputTokens = view.maxTokens;
-  if (view.stops.length > 0) config.stopSequences = view.stops;
-  if (view.jsonMode) config.responseMimeType = 'application/json';
-  if (view.temperature !== null) config.temperature = view.temperature;
-  if (view.topP !== null) config.topP = view.topP;
-  if (Object.keys(config).length > 0) body.generationConfig = config;
-  return body;
+  const config: JsonObject = {};
+  if (request.maxTokens !== null) config.maxOutputTokens = request.maxTokens;
+  if (request.stops.length > 0) config.stopSequences = request.stops;
+  if (request.jsonMode) config.responseMimeType = 'application/json';
+  if (request.temperature !== null) config.temperature = request.temperature;
+  if (request.topP !== null) config.topP = request.topP;
+  if (Object.keys(config).length > 0) payload.generationConfig = config;
+  return payload;
 }
 
-function viewToWire(wire: Wire, view: RequestView, model: string): Json {
-  if (wire === 'anthropic') return viewToAnthropic(view, model);
-  if (wire === 'gemini') return viewToGemini(view, model);
-  return viewToOpenAI(view, model);
+function viewAsWire(wire: ProviderWire, request: NormalizedRequest, model: string): JsonObject {
+  switch (wire) {
+    case 'anthropic':
+      return viewAsAnthropic(request, model);
+    case 'gemini':
+      return viewAsGemini(request, model);
+    default:
+      return viewAsOpenAI(request, model);
+  }
 }
 
-interface ProviderAnswer {
+interface UpstreamAnswer {
   text: string;
   finish: string;
   usage: { input: number; output: number };
 }
 
 /** The generated text of an OpenAI-shaped answer, empty when the answer has none. */
-function answerFromOpenAI(body: unknown): ProviderAnswer | null {
-  if (!isRecord(body) || !Array.isArray(body.choices) || body.choices.length === 0) return null;
-  const choice = body.choices[0];
-  if (!isRecord(choice)) return null;
-  const message = isRecord(choice.message) ? choice.message : null;
-  const text = message !== null ? textOf(message.content) : '';
-  const finish = typeof choice.finish_reason === 'string' ? choice.finish_reason : '';
-  const usage = isRecord(body.usage) ? body.usage : {};
-  return { text, finish, usage: { input: numberOrNull(usage.prompt_tokens) ?? 0, output: numberOrNull(usage.completion_tokens) ?? 0 } };
+function openAIToAnswer(payload: unknown): UpstreamAnswer | null {
+  if (!isJsonObject(payload) || !Array.isArray(payload.choices) || payload.choices.length === 0) return null;
+  const first = payload.choices[0];
+  if (!isJsonObject(first)) return null;
+  const message = isJsonObject(first.message) ? first.message : null;
+  const text = message !== null ? textFrom(message.content) : '';
+  const finish = typeof first.finish_reason === 'string' ? first.finish_reason : '';
+  const tokens = isJsonObject(payload.usage) ? payload.usage : {};
+  return { text, finish, usage: { input: asNumberOrNull(tokens.prompt_tokens) ?? 0, output: asNumberOrNull(tokens.completion_tokens) ?? 0 } };
 }
 
-function answerFromAnthropic(body: unknown): ProviderAnswer | null {
-  if (!isRecord(body)) return null;
-  const content = Array.isArray(body.content) ? body.content : [];
-  const text = content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
-  const finish = typeof body.stop_reason === 'string' ? body.stop_reason : '';
-  const usage = isRecord(body.usage) ? body.usage : {};
-  return { text, finish, usage: { input: numberOrNull(usage.input_tokens) ?? 0, output: numberOrNull(usage.output_tokens) ?? 0 } };
+function anthropicToAnswer(payload: unknown): UpstreamAnswer | null {
+  if (!isJsonObject(payload)) return null;
+  const content = Array.isArray(payload.content) ? payload.content : [];
+  const text = content.flatMap((block) => (isJsonObject(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : [])).join('\n');
+  const finish = typeof payload.stop_reason === 'string' ? payload.stop_reason : '';
+  const tokens = isJsonObject(payload.usage) ? payload.usage : {};
+  return { text, finish, usage: { input: asNumberOrNull(tokens.input_tokens) ?? 0, output: asNumberOrNull(tokens.output_tokens) ?? 0 } };
 }
 
-function answerFromGemini(body: unknown): ProviderAnswer | null {
-  if (!isRecord(body) || !Array.isArray(body.candidates) || body.candidates.length === 0) return null;
-  const candidate = body.candidates[0];
-  if (!isRecord(candidate) || !isRecord(candidate.content) || !Array.isArray(candidate.content.parts)) return null;
-  const text = candidate.content.parts.flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : [])).join('\n');
-  const finish = typeof candidate.finishReason === 'string' ? candidate.finishReason : '';
-  const usage = isRecord(body.usageMetadata) ? body.usageMetadata : {};
-  return { text, finish, usage: { input: numberOrNull(usage.promptTokenCount) ?? 0, output: numberOrNull(usage.candidatesTokenCount) ?? 0 } };
+function geminiToAnswer(payload: unknown): UpstreamAnswer | null {
+  if (!isJsonObject(payload) || !Array.isArray(payload.candidates) || payload.candidates.length === 0) return null;
+  const first = payload.candidates[0];
+  if (!isJsonObject(first) || !isJsonObject(first.content) || !Array.isArray(first.content.parts)) return null;
+  const text = first.content.parts.flatMap((part) => (isJsonObject(part) && typeof part.text === 'string' ? [part.text] : [])).join('\n');
+  const finish = typeof first.finishReason === 'string' ? first.finishReason : '';
+  const tokens = isJsonObject(payload.usageMetadata) ? payload.usageMetadata : {};
+  return { text, finish, usage: { input: asNumberOrNull(tokens.promptTokenCount) ?? 0, output: asNumberOrNull(tokens.candidatesTokenCount) ?? 0 } };
 }
 
-function answerFromWire(wire: Wire, body: unknown): ProviderAnswer | null {
-  if (wire === 'anthropic') return answerFromAnthropic(body);
-  if (wire === 'gemini') return answerFromGemini(body);
-  return answerFromOpenAI(body);
+function wireToAnswer(wire: ProviderWire, payload: unknown): UpstreamAnswer | null {
+  switch (wire) {
+    case 'anthropic':
+      return anthropicToAnswer(payload);
+    case 'gemini':
+      return geminiToAnswer(payload);
+    default:
+      return openAIToAnswer(payload);
+  }
 }
 
 /** The endpoint one provider's wire takes, given its base. */
-function inferUrl(provider: ProviderEntry, model: string): string {
-  const base = joinBase(ENV_URL, provider.base);
-  if (provider.wire === 'anthropic') return `${base}/v1/messages`;
-  if (provider.wire === 'gemini') return `${base}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-  return `${base}/v1/chat/completions`;
+function inferEndpoint(provider: Provider, model: string): string {
+  const root = resolveBase(ENV_ORIGIN, provider.basePath);
+  switch (provider.wire) {
+    case 'anthropic':
+      return `${root}/v1/messages`;
+    case 'gemini':
+      return `${root}/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    default:
+      return `${root}/v1/chat/completions`;
+  }
 }
 
-/** The HTTP status that means "this call failed" for one provider's wire. */
-function failureStatusOf(provider: ProviderEntry): number {
-  return provider.id === 'pollinations' ? 402 : 429;
-}
-
-type RefusalKind = 'spent' | 'out' | 'transient' | 'other';
+type Refusal = 'spent' | 'out' | 'transient' | 'other';
 
 /**
  * What a refusal means. The provider's message names the cause: the budget is spent
@@ -1013,52 +1056,52 @@ type RefusalKind = 'spent' | 'out' | 'transient' | 'other';
  * message is treated as transient — the only callers that send those codes here are
  * the refusal paths.
  */
-function classifyRefusal(provider: ProviderEntry, status: number, body: unknown): RefusalKind {
-  let message = '';
-  if (isRecord(body)) {
-    if (isRecord(body.error) && typeof body.error.message === 'string') message = body.error.message;
-    else if (typeof body.message === 'string') message = body.message;
-    else if (typeof body.error === 'string') message = body.error;
+function classifyFailure(provider: Provider, status: number, payload: unknown): Refusal {
+  let refusalText = '';
+  if (isJsonObject(payload)) {
+    if (isJsonObject(payload.error) && typeof payload.error.message === 'string') refusalText = payload.error.message;
+    else if (typeof payload.message === 'string') refusalText = payload.message;
+    else if (typeof payload.error === 'string') refusalText = payload.error;
   }
-  if (message.includes('budget is spent')) return 'spent';
-  if (message.trim().endsWith('is out')) return 'out';
-  if (message.includes('refused this call')) return 'transient';
-  if (message.includes('concurrent_requests')) return 'transient';
+  if (refusalText.includes('budget is spent')) return 'spent';
+  if (refusalText.trim().endsWith('is out')) return 'out';
+  if (refusalText.includes('refused this call')) return 'transient';
+  if (refusalText.includes('concurrent_requests')) return 'transient';
   if (status === 402 || status === 429) return 'transient';
   return 'other';
 }
 
-type CallOutcome =
-  | { ok: true; answer: ProviderAnswer }
-  | { ok: false; kind: RefusalKind; detail: string };
+type CallResult =
+  | { ok: true; answer: UpstreamAnswer }
+  | { ok: false; kind: Refusal; detail: string };
 
 /** One inference call, counted: every attempt spends budget, refused or not. */
-async function callProvider(provider: ProviderEntry, model: string, view: RequestView): Promise<CallOutcome> {
-  const state = stateOf(provider.id);
-  state.calls += 1;
-  const headers: Record<string, string> = { 'content-type': 'application/json', ...authHeaders(provider.auth, provider.key) };
-  if (provider.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
-  let res: Response;
+async function callUpstream(provider: Provider, model: string, request: NormalizedRequest): Promise<CallResult> {
+  const provState = stateFor(provider.id);
+  provState.calls++;
+  const hdrs: Record<string, string> = { 'content-type': 'application/json', ...headersForAuth(provider.auth, provider.key) };
+  if (provider.wire === 'anthropic') hdrs['anthropic-version'] = '2023-06-01';
+  let response: Response;
   try {
-    res = await fetch(inferUrl(provider, model), {
+    response = await fetch(inferEndpoint(provider, model), {
       method: 'POST',
-      headers,
-      body: JSON.stringify(viewToWire(provider.wire, view, model)),
+      headers: hdrs,
+      body: JSON.stringify(viewAsWire(provider.wire, request, model)),
       signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
     });
-  } catch (err) {
-    return { ok: false, kind: 'other', detail: `fetch to ${provider.id} failed: ${(err as Error).message}` };
+  } catch (error) {
+    return { ok: false, kind: 'other', detail: `fetch to ${provider.id} failed: ${(error as Error).message}` };
   }
-  let body: unknown = null;
+  let payload: unknown = null;
   try {
-    body = await res.json();
+    payload = await response.json();
   } catch {
-    body = null;
+    payload = null;
   }
-  if (!res.ok) {
-    return { ok: false, kind: classifyRefusal(provider, res.status, body), detail: `${provider.id} answered HTTP ${res.status}` };
+  if (!response.ok) {
+    return { ok: false, kind: classifyFailure(provider, response.status, payload), detail: `${provider.id} answered HTTP ${response.status}` };
   }
-  const answer = answerFromWire(provider.wire, body);
+  const answer = wireToAnswer(provider.wire, payload);
   if (answer === null) return { ok: false, kind: 'other', detail: `${provider.id} answered in a shape this server cannot read` };
   return { ok: true, answer };
 }
@@ -1067,47 +1110,47 @@ async function callProvider(provider: ProviderEntry, model: string, view: Reques
 // Routing: follow the plan, fall back by rating, retry a transient refusal once.
 // ---------------------------------------------------------------------------
 
-interface Candidate {
-  provider: ProviderEntry;
-  model: string;
+interface Fallback {
+  provider: Provider;
+  modelId: string;
   rating: number;
 }
 
 /** The providers that can serve one request, best-rated first (the fallback order). */
-function greedyCandidates(requires: Requirement, clientApi: 'openai' | 'anthropic', jsonMode: boolean): Candidate[] {
-  const out: Candidate[] = [];
-  for (const provider of brief.providers) {
-    if (stateOf(provider.id).dropped) continue;
-    const probe = probeOf(provider.id);
+function rankedCandidates(requires: RequestNeeds, clientApi: 'openai' | 'anthropic', jsonMode: boolean): Fallback[] {
+  const options: Fallback[] = [];
+  for (const entry of briefing.providers) {
+    if (stateFor(entry.id).dropped) continue;
+    const probe = probeFor(entry.id);
     if (probe === null) continue;
-    if (clientApi === 'openai' && jsonMode && provider.wire === 'anthropic') continue;
-    let best: RatingRow | null = null;
-    for (const model of probe.models) {
-      const row = ratingRow(provider.id, model.id);
+    if (clientApi === 'openai' && jsonMode && entry.wire === 'anthropic') continue;
+    let top: Rating | null = null;
+    for (const listed of probe.models) {
+      const row = ratingFor(entry.id, listed.id);
       if (row === null || !row.free) continue;
-      if (!rowMeets(requires, row)) continue;
-      if (best === null || row.rating_milli > best.rating_milli) best = row;
+      if (!satisfies(requires, row)) continue;
+      if (top === null || row.rating > top.rating) top = row;
     }
-    if (best !== null) out.push({ provider, model: best.model, rating: best.rating_milli });
+    if (top !== null) options.push({ provider: entry, modelId: top.model, rating: top.rating });
   }
   // Best-rated first; when two providers rate the same, the one whose next call
   // is less likely to fail goes first (same quality, fewer expected calls); the
   // provider id breaks any remaining tie, so the order is fully deterministic.
-  out.sort((a, b) => {
+  options.sort((a, b) => {
     if (b.rating !== a.rating) return b.rating - a.rating;
-    const aRisk = failChance(a.provider.id, stateOf(a.provider.id).calls + 1);
-    const bRisk = failChance(b.provider.id, stateOf(b.provider.id).calls + 1);
+    const aRisk = refusalChance(a.provider.id, stateFor(a.provider.id).calls + 1);
+    const bRisk = refusalChance(b.provider.id, stateFor(b.provider.id).calls + 1);
     if (aRisk !== bRisk) return aRisk - bRisk;
     return a.provider.id < b.provider.id ? -1 : a.provider.id > b.provider.id ? 1 : 0;
   });
-  return out;
+  return options;
 }
 
-interface ServedAnswer {
+interface Served {
   providerId: string;
-  model: string;
+  modelId: string;
   rating: number;
-  answer: ProviderAnswer;
+  answer: UpstreamAnswer;
 }
 
 /**
@@ -1119,42 +1162,42 @@ interface ServedAnswer {
  * when no provider served. The served rating rides along so the caller can book
  * the request's committed loss without a second lookup.
  */
-async function serve(
-  view: RequestView,
-  requires: Requirement,
+async function serveRequest(
+  request: NormalizedRequest,
+  requires: RequestNeeds,
   clientApi: 'openai' | 'anthropic',
   planIndex: number,
-): Promise<ServedAnswer | null> {
-  const fallback = greedyCandidates(requires, clientApi, view.jsonMode);
-  const ordered: Candidate[] = [];
-  const slot = planIndex >= 0 && planIndex < plan.length ? plan[planIndex] : null;
-  if (slot !== null && slot.providerId !== null && slot.model !== null) {
-    const planned = brief.providers.find((p) => p.id === slot.providerId) ?? null;
-    const probe = planned !== null ? probeOf(planned.id) : null;
-    if (planned !== null && probe !== null && !stateOf(planned.id).dropped) {
-      const row = ratingRow(planned.id, slot.model);
-      const jsonWireOk = !(clientApi === 'openai' && view.jsonMode && planned.wire === 'anthropic');
-      if (row !== null && row.free && rowMeets(requires, row) && jsonWireOk) {
-        ordered.push({ provider: planned, model: slot.model, rating: row.rating_milli });
+): Promise<Served | null> {
+  const fallbacks = rankedCandidates(requires, clientApi, request.jsonMode);
+  const tried: Fallback[] = [];
+  const slot = planIndex >= 0 && planIndex < assignments.length ? assignments[planIndex] : null;
+  if (slot !== null && slot.providerId !== null && slot.modelId !== null) {
+    const plannedProvider = briefing.providers.find((entry) => entry.id === slot.providerId) ?? null;
+    const plannedProbe = plannedProvider !== null ? probeFor(plannedProvider.id) : null;
+    if (plannedProvider !== null && plannedProbe !== null && !stateFor(plannedProvider.id).dropped) {
+      const plannedRating = ratingFor(plannedProvider.id, slot.modelId);
+      const jsonOk = !(clientApi === 'openai' && request.jsonMode && plannedProvider.wire === 'anthropic');
+      if (plannedRating !== null && plannedRating.free && satisfies(requires, plannedRating) && jsonOk) {
+        tried.push({ provider: plannedProvider, modelId: slot.modelId, rating: plannedRating.rating });
       }
     }
   }
-  for (const candidate of fallback) {
-    if (!ordered.some((c) => c.provider.id === candidate.provider.id)) ordered.push(candidate);
+  for (const option of fallbacks) {
+    if (!tried.some((entry) => entry.provider.id === option.provider.id)) tried.push(option);
   }
-  for (const candidate of ordered) {
-    const state = stateOf(candidate.provider.id);
-    if (state.dropped) continue;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const outcome = await callProvider(candidate.provider, candidate.model, view);
-      if (outcome.ok) return { providerId: candidate.provider.id, model: candidate.model, rating: candidate.rating, answer: outcome.answer };
-      if (outcome.kind === 'spent' || outcome.kind === 'out') {
-        log(`${candidate.provider.id} is done for the trial (${outcome.detail})`);
-        state.dropped = true;
+  for (const option of tried) {
+    const provState = stateFor(option.provider.id);
+    if (provState.dropped) continue;
+    for (let tryNo = 0; tryNo < 2; tryNo++) {
+      const callResult = await callUpstream(option.provider, option.modelId, request);
+      if (callResult.ok) return { providerId: option.provider.id, modelId: option.modelId, rating: option.rating, answer: callResult.answer };
+      if (callResult.kind === 'spent' || callResult.kind === 'out') {
+        note(`${option.provider.id} dropped for the trial (${callResult.detail})`);
+        provState.dropped = true;
         break;
       }
-      if (outcome.kind === 'transient' && attempt === 0) continue;
-      log(`${candidate.provider.id} refused (${outcome.detail})`);
+      if (callResult.kind === 'transient' && tryNo === 0) continue;
+      note(`${option.provider.id} refused this one (${callResult.detail})`);
       break;
     }
   }
@@ -1166,95 +1209,167 @@ async function serve(
 // ---------------------------------------------------------------------------
 
 /** A provider's finish reason as the client's wire spells it. */
-function clientStop(wire: 'openai' | 'anthropic', finish: string): string {
-  const f = finish.toLowerCase();
-  if (f === 'length' || f === 'max_tokens' || f === 'max_tokens_exceeded') return wire === 'openai' ? 'length' : 'max_tokens';
-  if (f === 'tool_calls' || f === 'function_call' || f === 'tool_use') return wire === 'openai' ? 'tool_calls' : 'tool_use';
-  if (f === 'content_filter' || f === 'refusal' || f === 'safety') return wire === 'openai' ? 'content_filter' : 'refusal';
-  return wire === 'openai' ? 'stop' : 'end_turn';
+function stopReasonFor(wire: 'openai' | 'anthropic', finish: string): string {
+  const normalized = finish.toLowerCase();
+  switch (normalized) {
+    case 'length':
+    case 'max_tokens':
+    case 'max_tokens_exceeded':
+      return wire === 'openai' ? 'length' : 'max_tokens';
+    case 'tool_calls':
+    case 'function_call':
+    case 'tool_use':
+      return wire === 'openai' ? 'tool_calls' : 'tool_use';
+    case 'content_filter':
+    case 'refusal':
+    case 'safety':
+      return wire === 'openai' ? 'content_filter' : 'refusal';
+    default:
+      return wire === 'openai' ? 'stop' : 'end_turn';
+  }
 }
 
 /** The answer as an OpenAI Chat Completions JSON body, with the provider's usage verbatim. */
-function openAIJson(answer: ProviderAnswer): string {
+function openAIResponse(answer: UpstreamAnswer): string {
   return JSON.stringify({
     id: 'chatcmpl-aggregator',
     object: 'chat.completion',
-    created: FIXED_CREATED,
+    created: FIXED_TIMESTAMP,
     model: 'aggregator',
-    choices: [{ index: 0, message: { role: 'assistant', content: answer.text }, finish_reason: clientStop('openai', answer.finish) }],
-    usage: { prompt_tokens: answer.usage.input, completion_tokens: answer.usage.output, total_tokens: answer.usage.input + answer.usage.output },
+    choices: [
+      {
+        index: 0,
+        message: { role: 'assistant', content: answer.text },
+        finish_reason: stopReasonFor('openai', answer.finish),
+      },
+    ],
+    usage: {
+      prompt_tokens: answer.usage.input,
+      completion_tokens: answer.usage.output,
+      total_tokens: answer.usage.input + answer.usage.output,
+    },
   });
 }
 
 /** The answer as an Anthropic Messages JSON body, with the provider's usage verbatim. */
-function anthropicJson(answer: ProviderAnswer): string {
+function anthropicResponse(answer: UpstreamAnswer): string {
   return JSON.stringify({
     id: 'msg_aggregator',
     type: 'message',
     role: 'assistant',
     model: 'aggregator',
     content: [{ type: 'text', text: answer.text }],
-    stop_reason: clientStop('anthropic', answer.finish),
+    stop_reason: stopReasonFor('anthropic', answer.finish),
     usage: { input_tokens: answer.usage.input, output_tokens: answer.usage.output },
   });
 }
 
 /** A string sliced into the deltas a stream sends, 13 characters at a time. */
-function deltasOf(text: string): string[] {
-  const out: string[] = [];
-  for (let i = 0; i < text.length; i += SSE_DELTA_CHARS) out.push(text.slice(i, i + SSE_DELTA_CHARS));
-  return out;
+function splitDeltas(text: string): string[] {
+  const collected: string[] = [];
+  for (let k = 0; k < text.length; k += STREAM_CHUNK_CHARS) collected.push(text.slice(k, k + STREAM_CHUNK_CHARS));
+  return collected;
 }
 
 /** The answer as an OpenAI SSE stream: role chunk, text deltas, finish chunk, usage chunk, [DONE]. */
-function openAIStream(answer: ProviderAnswer): string {
-  const chunks: string[] = [];
-  chunks.push(`data: ${JSON.stringify({ id: 'chatcmpl-aggregator', object: 'chat.completion.chunk', created: FIXED_CREATED, model: 'aggregator', choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] })}\n\n`);
-  for (const delta of deltasOf(answer.text)) {
-    chunks.push(`data: ${JSON.stringify({ id: 'chatcmpl-aggregator', object: 'chat.completion.chunk', created: FIXED_CREATED, model: 'aggregator', choices: [{ index: 0, delta: { content: delta }, finish_reason: null }] })}\n\n`);
+function openAIEvents(answer: UpstreamAnswer): string {
+  const events: string[] = [];
+  const roleChunk = {
+    id: 'chatcmpl-aggregator',
+    object: 'chat.completion.chunk',
+    created: FIXED_TIMESTAMP,
+    model: 'aggregator',
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  };
+  events.push(`data: ${JSON.stringify(roleChunk)}\n\n`);
+  for (const piece of splitDeltas(answer.text)) {
+    const textChunk = {
+      id: 'chatcmpl-aggregator',
+      object: 'chat.completion.chunk',
+      created: FIXED_TIMESTAMP,
+      model: 'aggregator',
+      choices: [{ index: 0, delta: { content: piece }, finish_reason: null }],
+    };
+    events.push(`data: ${JSON.stringify(textChunk)}\n\n`);
   }
-  chunks.push(`data: ${JSON.stringify({ id: 'chatcmpl-aggregator', object: 'chat.completion.chunk', created: FIXED_CREATED, model: 'aggregator', choices: [{ index: 0, delta: {}, finish_reason: clientStop('openai', answer.finish) }], usage: { prompt_tokens: answer.usage.input, completion_tokens: answer.usage.output, total_tokens: answer.usage.input + answer.usage.output } })}\n\n`);
-  chunks.push(`data: ${JSON.stringify({ id: 'chatcmpl-aggregator', object: 'chat.completion.chunk', created: FIXED_CREATED, model: 'aggregator', choices: [], usage: { prompt_tokens: answer.usage.input, completion_tokens: answer.usage.output, total_tokens: answer.usage.input + answer.usage.output } })}\n\n`);
-  chunks.push('data: [DONE]\n\n');
-  return chunks.join('');
+  const usage = {
+    prompt_tokens: answer.usage.input,
+    completion_tokens: answer.usage.output,
+    total_tokens: answer.usage.input + answer.usage.output,
+  };
+  const finishChunk = {
+    id: 'chatcmpl-aggregator',
+    object: 'chat.completion.chunk',
+    created: FIXED_TIMESTAMP,
+    model: 'aggregator',
+    choices: [{ index: 0, delta: {}, finish_reason: stopReasonFor('openai', answer.finish) }],
+    usage,
+  };
+  events.push(`data: ${JSON.stringify(finishChunk)}\n\n`);
+  const usageChunk = {
+    id: 'chatcmpl-aggregator',
+    object: 'chat.completion.chunk',
+    created: FIXED_TIMESTAMP,
+    model: 'aggregator',
+    choices: [],
+    usage,
+  };
+  events.push(`data: ${JSON.stringify(usageChunk)}\n\n`);
+  events.push('data: [DONE]\n\n');
+  return events.join('');
 }
 
 /** The answer as an Anthropic SSE stream: the full event sequence, with usage on both ends. */
-function anthropicStream(answer: ProviderAnswer): string {
-  const chunks: string[] = [];
-  const start = {
+function anthropicEvents(answer: UpstreamAnswer): string {
+  const events: string[] = [];
+  const startEvent = {
     type: 'message_start',
-    message: { id: 'msg_aggregator', type: 'message', role: 'assistant', model: 'aggregator', content: [], stop_reason: null, usage: { input_tokens: answer.usage.input, output_tokens: 0 } },
+    message: {
+      id: 'msg_aggregator',
+      type: 'message',
+      role: 'assistant',
+      model: 'aggregator',
+      content: [],
+      stop_reason: null,
+      usage: { input_tokens: answer.usage.input, output_tokens: 0 },
+    },
   };
-  chunks.push(`event: message_start\ndata: ${JSON.stringify(start)}\n\n`);
-  chunks.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
-  for (const delta of deltasOf(answer.text)) {
-    chunks.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: delta } })}\n\n`);
+  events.push(`event: message_start\ndata: ${JSON.stringify(startEvent)}\n\n`);
+  events.push(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\n`);
+  for (const piece of splitDeltas(answer.text)) {
+    events.push(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: piece } })}\n\n`);
   }
-  chunks.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
-  chunks.push(`event: message_delta\ndata: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: clientStop('anthropic', answer.finish) }, usage: { output_tokens: answer.usage.output } })}\n\n`);
-  chunks.push(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-  return chunks.join('');
+  events.push(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n\n`);
+  const deltaEvent = {
+    type: 'message_delta',
+    delta: { stop_reason: stopReasonFor('anthropic', answer.finish) },
+    usage: { output_tokens: answer.usage.output },
+  };
+  events.push(`event: message_delta\ndata: ${JSON.stringify(deltaEvent)}\n\n`);
+  events.push(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+  return events.join('');
 }
 
 /** The free models one provider offers, each id once, sorted — what /v1/models lists. */
-function servedModels(provider: CatalogProvider): string[] {
-  return [...new Set(provider.models.filter((m) => m.free).map((m) => m.id))].sort();
+function freeModelIds(provider: CatalogedProvider): string[] {
+  return [...new Set(provider.models.filter((entry) => entry.free).map((entry) => entry.id))].sort();
 }
 
 /** The catalog as an OpenAI-shaped model listing. */
-function modelsOpenAI(): string {
+function openAIModelList(): string {
   return JSON.stringify({
     object: 'list',
-    data: catalog.providers.flatMap((provider) => servedModels(provider).map((id) => ({ id, object: 'model', created: FIXED_CREATED, owned_by: provider.id }))),
+    data: registry.providers.flatMap((provider) =>
+      freeModelIds(provider).map((id) => ({ id, object: 'model', created: FIXED_TIMESTAMP, owned_by: provider.id })),
+    ),
   });
 }
 
 /** The catalog as an Anthropic-shaped model listing. */
-function modelsAnthropic(): string {
+function anthropicModelList(): string {
   return JSON.stringify({
-    data: catalog.providers.flatMap((provider) =>
-      servedModels(provider).map((id) => ({ id, type: 'model', display_name: id, created_at: FIXED_ANTHROPIC_CREATED_AT })),
+    data: registry.providers.flatMap((provider) =>
+      freeModelIds(provider).map((id) => ({ id, type: 'model', display_name: id, created_at: FIXED_ANTHROPIC_CREATED_AT })),
     ),
     has_more: false,
     first_id: null,
@@ -1263,8 +1378,8 @@ function modelsAnthropic(): string {
 }
 
 /** The catalog listing in the wire the client's auth header names. */
-function modelsList(req: IncomingMessage): string {
-  return req.headers['x-api-key'] !== undefined ? modelsAnthropic() : modelsOpenAI();
+function modelListFor(req: IncomingMessage): string {
+  return req.headers['x-api-key'] !== undefined ? anthropicModelList() : openAIModelList();
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,36 +1387,36 @@ function modelsList(req: IncomingMessage): string {
 // ---------------------------------------------------------------------------
 
 /** Read a request body, failing past the size limit or a socket error. */
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function readRequestBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const parts: Buffer[] = [];
-    let length = 0;
-    req.on('data', (chunk: Buffer) => {
-      length += chunk.length;
-      if (length > MAX_BODY_BYTES) {
+    const segments: Buffer[] = [];
+    let total = 0;
+    req.on('data', (piece: Buffer) => {
+      total += piece.length;
+      if (total > MAX_BODY_BYTES) {
         reject(new Error('body too large'));
         return;
       }
-      parts.push(chunk);
+      segments.push(piece);
     });
-    req.on('end', () => resolve(Buffer.concat(parts)));
+    req.on('end', () => resolve(Buffer.concat(segments)));
     req.on('error', reject);
   });
 }
 
 /** A JSON body, or the error shape the client wires expect. */
-function parseBody(raw: Buffer): { body: Json | null; error: string | null } {
-  if (raw.length === 0) return { body: null, error: 'empty body' };
+function parseJsonBody(rawBytes: Buffer): { body: JsonObject | null; error: string | null } {
+  if (rawBytes.length === 0) return { body: null, error: 'empty body' };
   try {
-    const value: unknown = JSON.parse(raw.toString('utf8'));
-    if (!isRecord(value)) return { body: null, error: 'body is not a JSON object' };
-    return { body: value, error: null };
+    const parsed: unknown = JSON.parse(rawBytes.toString('utf8'));
+    if (!isJsonObject(parsed)) return { body: null, error: 'body is not a JSON object' };
+    return { body: parsed, error: null };
   } catch {
     return { body: null, error: 'body is not JSON' };
   }
 }
 
-function sendJson(res: ServerResponse, status: number, value: unknown): void {
+function sendJsonResponse(res: ServerResponse, status: number, value: unknown): void {
   const text = JSON.stringify(value);
   res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
   res.end(text);
@@ -1309,28 +1424,28 @@ function sendJson(res: ServerResponse, status: number, value: unknown): void {
 
 /** The next manifest row, claimed by arrival: this runs synchronously at request start,
  *  before any await, so two requests arriving together are never handed the same row. */
-function claimRow(): { requires: Requirement; weight: number; index: number } {
-  const row = manifestIndex < brief.manifest.length ? brief.manifest[manifestIndex] : null;
-  const index = manifestIndex;
-  manifestIndex += 1;
-  if (row === null) return { requires: {}, weight: 1, index };
-  return { requires: row.requires, weight: row.weight, index };
+function claimManifestRow(): { requires: RequestNeeds; weight: number; index: number } {
+  const current = nextRow < briefing.manifest.length ? briefing.manifest[nextRow] : null;
+  const index = nextRow;
+  nextRow++;
+  if (current === null) return { requires: {}, weight: 1, index };
+  return { requires: current.requires, weight: current.weight, index };
 }
 
 /** A request's requirements read from its own body, for requests past the manifest's end. */
-function requirementsFromBody(api: 'openai' | 'anthropic', body: Json): Requirement {
-  const requires: Requirement = {};
+function requirementsInBody(api: 'openai' | 'anthropic', body: JsonObject): RequestNeeds {
+  const requires: RequestNeeds = {};
   if (Array.isArray(body.tools) && body.tools.length > 0) requires.tools = true;
-  if (api === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema')) {
+  if (api === 'openai' && isJsonObject(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema')) {
     requires.json = true;
   }
   const messages = Array.isArray(body.messages) ? body.messages : [];
   for (const message of messages) {
-    if (!isRecord(message)) continue;
+    if (!isJsonObject(message)) continue;
     const content = message.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
-      if (!isRecord(block)) continue;
+      if (!isJsonObject(block)) continue;
       if (block.type === 'image_url' || block.type === 'image') requires.vision = true;
     }
   }
@@ -1338,70 +1453,72 @@ function requirementsFromBody(api: 'openai' | 'anthropic', body: Json): Requirem
 }
 
 /** One client request, start to finish. */
-async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  const path = url.pathname;
-  const method = req.method ?? '';
-  if (method === 'GET' && path === '/v1/models') {
-    const text = modelsList(req);
-    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) });
-    res.end(text);
+async function handleClientRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const parsedUrl = new URL(req.url ?? '/', 'http://localhost');
+  const route = parsedUrl.pathname;
+  const verb = req.method ?? '';
+  if (verb === 'GET' && route === '/v1/models') {
+    const listing = modelListFor(req);
+    res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(listing) });
+    res.end(listing);
     return;
   }
-  const api: 'openai' | 'anthropic' | null = method === 'POST' && path === '/v1/chat/completions' ? 'openai' : method === 'POST' && path === '/v1/messages' ? 'anthropic' : null;
+  let api: 'openai' | 'anthropic' | null = null;
+  if (verb === 'POST' && route === '/v1/chat/completions') api = 'openai';
+  else if (verb === 'POST' && route === '/v1/messages') api = 'anthropic';
   if (api === null) {
-    sendJson(res, 404, { error: { message: `unknown route ${method} ${path}`, type: 'not_found', code: 'not_found' } });
+    sendJsonResponse(res, 404, { error: { message: `unknown route ${verb} ${route}`, type: 'not_found', code: 'not_found' } });
     return;
   }
-  const row = claimRow();
-  let raw: Buffer;
+  const row = claimManifestRow();
+  let rawBytes: Buffer;
   try {
-    raw = await readBody(req);
+    rawBytes = await readRequestBody(req);
   } catch {
-    sendJson(res, 400, { error: { message: 'could not read request body', type: 'invalid_request_error', code: 'invalid_request_error' } });
+    sendJsonResponse(res, 400, { error: { message: 'could not read request body', type: 'invalid_request_error', code: 'invalid_request_error' } });
     return;
   }
-  const parsed = parseBody(raw);
-  if (parsed.body === null) {
-    sendJson(res, 400, { error: { message: parsed.error ?? 'invalid body', type: 'invalid_request_error', code: 'invalid_request_error' } });
+  const decoded = parseJsonBody(rawBytes);
+  if (decoded.body === null) {
+    sendJsonResponse(res, 400, { error: { message: decoded.error ?? 'invalid body', type: 'invalid_request_error', code: 'invalid_request_error' } });
     return;
   }
-  const body = parsed.body;
-  const view = api === 'openai' ? viewFromOpenAI(body) : viewFromAnthropic(body);
-  const requires = row.index < brief.manifest.length ? row.requires : requirementsFromBody(api, body);
+  const body = decoded.body;
+  const view = api === 'openai' ? openAIToView(body) : anthropicToView(body);
+  const requires = row.index < briefing.manifest.length ? row.requires : requirementsInBody(api, body);
   // Snapshot the dropped set: a provider that drops while this request is served
   // changes the feasible set, and the remaining rows get re-planned for it.
-  const droppedBefore = new Set<string>();
-  for (const provider of brief.providers) if (stateOf(provider.id).dropped) droppedBefore.add(provider.id);
-  const served = await serve(view, requires, api, row.index);
+  const droppedAtStart = new Set<string>();
+  for (const entry of briefing.providers) if (stateFor(entry.id).dropped) droppedAtStart.add(entry.id);
+  const result = await serveRequest(view, requires, api, row.index);
   // Book this request's committed loss, then re-plan what is left if the feasible
   // set changed. Both run synchronously here, before the response goes out, so no
   // other request can interleave between the booking and the re-plan.
-  if (served !== null && row.index < plan.length) {
-    const slot = plan[row.index];
-    committedLoss += row.weight * Math.max(0, slot.bestRating - served.rating);
+  if (result !== null && row.index < assignments.length) {
+    const slot = assignments[row.index];
+    lossCommitted += row.weight * Math.max(0, slot.topRating - result.rating);
   }
-  const droppedNow = brief.providers.some((p) => stateOf(p.id).dropped && !droppedBefore.has(p.id));
-  if (droppedNow) replanFrom(row.index + 1);
-  if (served === null) {
-    sendJson(res, 503, { error: { message: 'no provider could serve this request', type: 'service_unavailable', code: 'service_unavailable' } });
+  const droppedDuring = briefing.providers.some((entry) => stateFor(entry.id).dropped && !droppedAtStart.has(entry.id));
+  if (droppedDuring) replanAfter(row.index + 1);
+  if (result === null) {
+    sendJsonResponse(res, 503, { error: { message: 'no provider could serve this request', type: 'service_unavailable', code: 'service_unavailable' } });
     return;
   }
   if (view.stream) {
-    const text = api === 'openai' ? openAIStream(served.answer) : anthropicStream(served.answer);
+    const text = api === 'openai' ? openAIEvents(result.answer) : anthropicEvents(result.answer);
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'content-length': Buffer.byteLength(text) });
     res.end(text);
     return;
   }
-  sendJson(res, 200, JSON.parse(api === 'openai' ? openAIJson(served.answer) : anthropicJson(served.answer)));
+  sendJsonResponse(res, 200, JSON.parse(api === 'openai' ? openAIResponse(result.answer) : anthropicResponse(result.answer)));
 }
 
 /** Create the server: the request handler's errors are answered 500, never left hanging. */
-function createHttpServer(): Server {
+function makeServer(): Server {
   return createServer((req, res) => {
-    handleRequest(req, res).catch((err: unknown) => {
+    handleClientRequest(req, res).catch((error: unknown) => {
       if (!res.headersSent) {
-        sendJson(res, 500, { error: { message: (err as Error).message, type: 'internal_error', code: 'internal_error' } });
+        sendJsonResponse(res, 500, { error: { message: (error as Error).message, type: 'internal_error', code: 'internal_error' } });
       } else {
         res.end();
       }
@@ -1414,24 +1531,24 @@ function createHttpServer(): Server {
 // ---------------------------------------------------------------------------
 
 /** Register this server with the trial env: the catalog it answers from. */
-async function register(port: number): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
+async function registerWithEnv(port: number): Promise<void> {
+  const response = await fetch(`${ENV_ORIGIN}/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog }),
+    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: registry }),
     signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`register failed with HTTP ${res.status}`);
+  if (!response.ok) throw new Error(`registration failed: HTTP ${response.status}`);
 }
 
 /** Poll the env until the trial is done, then close the server and exit. */
-async function pollUntilDone(server: Server): Promise<void> {
-  for (;;) {
+async function waitForTrialEnd(server: Server): Promise<void> {
+  while (true) {
     try {
-      const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
-      if (res.ok) {
-        const body: unknown = await res.json();
-        if (isRecord(body) && body.done === true) break;
+      const response = await fetch(`${ENV_ORIGIN}/work`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      if (response.ok) {
+        const payload: unknown = await response.json();
+        if (isJsonObject(payload) && payload.done === true) break;
       }
     } catch {
       // The env not answering yet is not a failure: wait and ask again.
@@ -1442,38 +1559,38 @@ async function pollUntilDone(server: Server): Promise<void> {
   process.exit(0);
 }
 
-async function start(): Promise<void> {
-  await load();
+async function main(): Promise<void> {
+  await probeAll();
   if (process.argv.includes('--list')) {
-    const text = `${JSON.stringify(catalog)}\n`;
+    const text = `${JSON.stringify(registry)}\n`;
     await new Promise<void>((resolve) => {
       if (process.stdout.write(text)) resolve();
       else process.stdout.once('drain', resolve);
     });
     process.exit(0);
   }
-  if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
-  plan = computePlan();
-  const server = createHttpServer();
+  if (ENV_ORIGIN === '') throw new Error('MAKEFUN_ENV_URL is not set');
+  assignments = initialPlan();
+  const httpServer = makeServer();
   await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      server.removeListener('error', reject);
+    httpServer.once('error', reject);
+    httpServer.listen(0, '127.0.0.1', () => {
+      httpServer.removeListener('error', reject);
       resolve();
     });
   });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('server did not bind a port');
-  const port = address.port;
-  await register(port);
+  const bound = httpServer.address();
+  if (bound === null || typeof bound === 'string') throw new Error('server did not bind a port');
+  const listenPort = bound.port;
+  await registerWithEnv(listenPort);
   process.on('SIGTERM', () => process.exit(0));
   process.on('SIGINT', () => process.exit(0));
-  await pollUntilDone(server);
+  await waitForTrialEnd(httpServer);
 }
 
 try {
-  await start();
-} catch (err) {
-  log((err as Error).message);
+  await main();
+} catch (error) {
+  note((error as Error).message);
   process.exit(1);
 }
